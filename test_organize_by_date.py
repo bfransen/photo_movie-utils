@@ -200,7 +200,7 @@ def test_organize_nested_directories(temp_dirs):
 
 
 def test_skip_duplicate_files(temp_dirs):
-    """Test that duplicate files (same name) are skipped."""
+    """Test that duplicate files (same name and content) are skipped."""
     source_dir, dest_dir = temp_dirs
     
     test_date = datetime(2023, 8, 1, 12, 0, 0)
@@ -212,11 +212,43 @@ def test_skip_duplicate_files(temp_dirs):
     stats1 = organize_files(source_dir, dest_dir, dry_run=False)
     assert stats1['copied'] == 1
     
-    # Try to organize again (should skip)
+    # Try to organize again (should skip - same file)
     stats2 = organize_files(source_dir, dest_dir, dry_run=False)
     assert stats2['processed'] == 1
     assert stats2['skipped'] == 1
     assert stats2['copied'] == 0
+
+
+def test_handle_different_files_same_name(temp_dirs):
+    """Test that different files with the same name are renamed."""
+    source_dir, dest_dir = temp_dirs
+    
+    test_date = datetime(2023, 8, 1, 12, 0, 0)
+    
+    # Create first file and organize it
+    file1 = source_dir / "same_name.txt"
+    create_test_file(file1, "content 1", test_date)
+    
+    stats1 = organize_files(source_dir, dest_dir, dry_run=False)
+    assert stats1['copied'] == 1
+    assert (dest_dir / "2023-08-01" / "same_name.txt").exists()
+    
+    # Create a different file with the same name
+    file2 = source_dir / "subdir" / "same_name.txt"
+    create_test_file(file2, "different content", test_date)
+    
+    stats2 = organize_files(source_dir, dest_dir, dry_run=False)
+    assert stats2['processed'] == 1
+    assert stats2['copied'] == 1
+    
+    # Should have both files - original and renamed version
+    date_folder = dest_dir / "2023-08-01"
+    assert (date_folder / "same_name.txt").exists()
+    assert (date_folder / "same_name_1.txt").exists()
+    
+    # Verify they have different content
+    assert (date_folder / "same_name.txt").read_text() == "content 1"
+    assert (date_folder / "same_name_1.txt").read_text() == "different content"
 
 
 def test_get_file_date_fallback(temp_dirs):

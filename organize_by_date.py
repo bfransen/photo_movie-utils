@@ -8,6 +8,7 @@ video metadata for videos, file timestamps for all other files).
 """
 
 import argparse
+import hashlib
 import logging
 import sys
 from datetime import datetime
@@ -161,6 +162,61 @@ def parse_video_datetime(date_str: str) -> Optional[datetime]:
     return None
 
 
+def calculate_file_hash(file_path: Path) -> str:
+    """Calculate SHA256 hash of a file.
+    
+    Args:
+        file_path: Path to the file to hash
+        
+    Returns:
+        Hexadecimal string representation of the hash
+    """
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            # Read file in chunks to handle large files efficiently
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logging.debug(f"Failed to hash {file_path}: {e}")
+        return ""
+
+
+def find_unique_filename(dest_folder: Path, base_name: str) -> Path:
+    """Find a unique filename by appending numbers if needed.
+    
+    Args:
+        dest_folder: Destination folder path
+        base_name: Base filename (e.g., "photo.jpg")
+        
+    Returns:
+        Path to a unique filename (e.g., "photo.jpg", "photo_1.jpg", "photo_2.jpg")
+    """
+    dest_file = dest_folder / base_name
+    
+    # If the file doesn't exist, return it as-is
+    if not dest_file.exists():
+        return dest_file
+    
+    # Split filename and extension
+    stem = dest_file.stem
+    suffix = dest_file.suffix
+    
+    # Try appending numbers until we find a unique name
+    counter = 1
+    while True:
+        new_name = f"{stem}_{counter}{suffix}"
+        dest_file = dest_folder / new_name
+        if not dest_file.exists():
+            return dest_file
+        counter += 1
+        
+        # Safety limit to prevent infinite loops
+        if counter > 10000:
+            raise ValueError(f"Could not find unique filename for {base_name} after 10000 attempts")
+
+
 def get_file_timestamps(file_path: Path) -> Tuple[datetime, datetime]:
     """Get file creation and modification timestamps.
     
@@ -203,6 +259,9 @@ def copy_file_to_dated_folder(source_file: Path, destination_root: Path,
                                dry_run: bool = False) -> Tuple[bool, str]:
     """Copy a file to the appropriate dated folder.
     
+    If a file with the same name exists, compares hashes to determine if it's
+    the same file. If different, appends a number to create a unique filename.
+    
     Returns (success, message) tuple.
     """
     try:
@@ -216,7 +275,17 @@ def copy_file_to_dated_folder(source_file: Path, destination_root: Path,
         
         # Check if file already exists
         if dest_file.exists():
-            return True, f"Skipped (already exists): {dest_file}"
+            # Calculate hashes to see if files are identical
+            source_hash = calculate_file_hash(source_file)
+            dest_hash = calculate_file_hash(dest_file)
+            
+            # Only skip if both hashes were calculated successfully and they match
+            if source_hash and dest_hash and source_hash == dest_hash:
+                # Files are identical, skip
+                return True, f"Skipped (already exists, identical): {dest_file}"
+            else:
+                # Files are different or hash calculation failed, find a unique filename
+                dest_file = find_unique_filename(dest_folder, source_file.name)
         
         # Create destination folder if needed
         if not dry_run:
@@ -226,9 +295,15 @@ def copy_file_to_dated_folder(source_file: Path, destination_root: Path,
         if not dry_run:
             import shutil
             shutil.copy2(source_file, dest_file)
-            return True, f"Copied to {dest_file}"
+            if dest_file.name != source_file.name:
+                return True, f"Copied to {dest_file} (renamed due to duplicate name)"
+            else:
+                return True, f"Copied to {dest_file}"
         else:
-            return True, f"[DRY RUN] Would copy to {dest_file}"
+            if dest_file.name != source_file.name:
+                return True, f"[DRY RUN] Would copy to {dest_file} (renamed due to duplicate name)"
+            else:
+                return True, f"[DRY RUN] Would copy to {dest_file}"
             
     except Exception as e:
         return False, f"Error: {str(e)}"
@@ -266,7 +341,7 @@ def organize_files(source_dir: Path, destination_dir: Path,
         )
         
         if success:
-            if 'already exists' in message.lower():
+            if 'already exists' in message.lower() and 'identical' in message.lower():
                 stats['skipped'] += 1
             else:
                 stats['copied'] += 1
