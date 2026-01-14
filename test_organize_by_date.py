@@ -238,8 +238,9 @@ def test_handle_different_files_same_name(temp_dirs):
     create_test_file(file2, "different content", test_date)
     
     stats2 = organize_files(source_dir, dest_dir, dry_run=False)
-    assert stats2['processed'] == 1
-    assert stats2['copied'] == 1
+    assert stats2['processed'] == 2  # Both files in source directory are processed
+    assert stats2['copied'] == 1  # Second file is copied (renamed)
+    assert stats2['skipped'] == 1  # First file is skipped (already exists, identical)
     
     # Should have both files - original and renamed version
     date_folder = dest_dir / "2023-08-01"
