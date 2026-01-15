@@ -9,7 +9,7 @@ Built with an AI first approach using Cursor.
 This collection of utilities helps organize and manage photo and movie files:
 
 - **organize_by_date.py**: Organize files into dated folders based on EXIF/metadata
-- **rename_folders.py**: Rename folders exported from Apple's Photos Nac app to standardized YYYY-MM-DD format
+- **rename_folders.py**: Rename folders exported from Apple's Photos Mac app to standardized YYYY-MM-DD format
 - **delete_by_filename.py**: Clean up system files (e.g., macOS `._` files)
 - **verify_backup.py**: Confirm that data in a photo collection with date centric folders produced by "rename_folders" and "organize_by_date" contain the complete collection of files found in source folders named in the Apple Photos format.
 
