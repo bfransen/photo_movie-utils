@@ -12,6 +12,7 @@ This collection of utilities helps organize and manage photo and movie files:
 - **rename_folders.py**: Rename folders exported from Apple's Photos Mac app to standardized YYYY-MM-DD format
 - **delete_by_filename.py**: Clean up system files (e.g., macOS `._` files)
 - **verify_backup.py**: Confirm that data in a photo collection with date centric folders produced by "rename_folders" and "organize_by_date" contain the complete collection of files found in source folders named in the Apple Photos format.
+- **verify_integrity.py**: Scan files, hash new or changed entries, store results in SQLite, and output JSON reports.
 
 ## Installation
 
@@ -281,6 +282,35 @@ date, desc = parse_destination_folder_name("2022-09-10_CrescentPark-SurreyBC")
 - Supports both full month names and abbreviations (e.g., "Jan", "January")
 - Returns `(None, None)` for invalid or unparseable folder names
 - Validates dates (e.g., rejects February 30)
+
+---
+
+## verify_integrity.py
+
+Scans a directory tree, computes SHA-256 hashes for new or changed files, and stores
+them in a local SQLite database. Outputs a JSON report.
+
+### Features
+
+- **Incremental hashing**: Only new or changed files are hashed
+- **SQLite storage**: Stores path, size, mtime, hash, and last_seen
+- **Exclude file types**: Skip file extensions you do not want to track
+- **JSON report**: Summary output to stdout or a report file
+
+### Usage
+
+```bash
+# Index files and write a JSON report
+python verify_integrity.py index --root /path/to/photos --db integrity.db --report report.json
+
+# Exclude file types by extension
+python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db --report report.json
+```
+
+### Notes
+
+- The script does not follow symlinks.
+- Use `--report` if you want a detailed JSON file with added/updated entries.
 
 ---
 
