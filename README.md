@@ -1,17 +1,22 @@
 # Photo & Movie Organization Utilities
 
-Python scripts for managing and organizing photo and movie files.
-
-Built with an AI first approach using Cursor.
+Built with AI using Cursor.
 
 ## Overview
 
-This collection of utilities helps organize and manage photo and movie files:
+This collection of utilities helps organize and manage photo and movie files.
 
-- **organize_by_date.py**: Organize files into dated folders based on EXIF/metadata
-- **rename_folders.py**: Rename folders exported from Apple's Photos Mac app to standardized YYYY-MM-DD format
-- **delete_by_filename.py**: Clean up system files (e.g., macOS `._` files)
-- **verify_backup.py**: Confirm that data in a photo collection with date centric folders produced by "rename_folders" and "organize_by_date" contain the complete collection of files found in source folders named in the Apple Photos format.
+It was created in response to me having a hard drive with 4 TB of photos and videos on a 2012 iMac in the Photos app.  I wanted to move the collection to a modern non-Apple machine and have full control over the data.  Exporting from Photos resulted in folder names that were poorly named and included proprietaru mac metadata that needed cleaning.  
+
+The scripts were used to move the data from Photos to a windows drive.
+
+- **rename_folders.py**: Rename folders exported from Apple's Photos Mac app to standardized YYYY-MM-DD format.   This script can be used after files were exported from the Photos app.  
+
+- **organize_by_date.py**: Organize files into dated folders based on EXIF/metadata.  This script is useful after copying photos and movies out of an iPhone.   The resulting files are not sorted into sub-folders.  This script puts them in dated sub-folders.
+
+- **delete_by_filename.py**: Clean up mac metadata files (e.g., macOS `._` files).  I don't want these.  Someone might if they intend to rehydrate the files into a Mac OS.  
+
+- **verify_backup.py**: Confirm that data in a photo collection with date centric folders produced by "rename_folders" and "organize_by_date" contain the complete collection of files found in source folders named in the Apple Photos format.   This script is used as a sanity check to make sure the above scripts didn't miss any data or delete any real files.   Also useful after I've been working in my photo library and realize I may have accidentally deleted data.
 
 ## Installation
 
@@ -221,41 +226,98 @@ python delete_by_filename.py --source /path/to/files --verbose --log delete.log
 
 ## verify_backup.py
 
-Utility module providing functions to parse and match folder names containing dates in different formats. Useful for comparing source and destination folder structures when verifying backups.
+Verifies that backup folders contain all files from source folders by matching folders by date and comparing file contents. Designed to verify that photo collections with date-centric folders (produced by `rename_folders.py` and `organize_by_date.py`) contain the complete collection of files found in source folders named in the Apple Photos format.
 
 ### Features
 
-- **Flexible date parsing**: Handles multiple date formats
-- **Source folder parsing**: Parses "Month Day, Year" format (e.g., "September 10, 2022")
-- **Destination folder parsing**: Parses "YYYY-MM-DD" format (e.g., "2022-09-10")
-- **Description extraction**: Extracts optional descriptions from folder names
-- **Case-insensitive**: Handles various month name formats and abbreviations
-
-### Functions
-
-#### `parse_source_folder_name(folder_name: str)`
-
-Parses source folder names with dates in "Month Day, Year" format.
-
-**Supported formats:**
-- `"September 10, 2022"`
-- `"Crescent Park - Surrey, BC, September 10, 2022"`
-- `"Description Text, September 10, 2022"`
-
-**Returns:** Tuple of `(date, description)` where date is a datetime object and description is an optional string.
-
-#### `parse_destination_folder_name(folder_name: str)`
-
-Parses destination folder names with dates in "YYYY-MM-DD" format.
-
-**Supported formats:**
-- `"2022-09-10"`
-- `"2022-09-10_CrescentPark-SurreyBC"`
-- `"2022-09-10_Description"`
-
-**Returns:** Tuple of `(date, description)` where date is a datetime object and description is an optional string.
+- **Date-based folder matching**: Automatically matches source and destination folders by date, handling different naming conventions
+- **File verification**: Verifies files exist in destination by filename and size
+- **Comprehensive logging**: Logs all scanning and verification operations
+- **Detailed reporting**: Generates reports showing folder statistics and missing files
+- **Flexible file filtering**: Option to ignore files that would be cleaned up by `delete_by_filename.py`
+- **Subdirectory support**: Handles files in nested subdirectories within folders
+- **Size mismatch detection**: Identifies files that exist but have different sizes
 
 ### Usage
+
+```bash
+# Basic verification
+python verify_backup.py --source /path/to/source --destination /path/to/dest
+
+# Ignore files that would be deleted by delete_by_filename script
+python verify_backup.py --source /path/to/source --destination /path/to/dest --ignore-deleted
+
+# Save log and report to files
+python verify_backup.py --source /path/to/source --destination /path/to/dest --log verify.log --report report.txt
+
+# Verbose logging
+python verify_backup.py --source /path/to/source --destination /path/to/dest --verbose
+```
+
+### Command Line Options
+
+- `--source`: Source directory containing folders to verify (required)
+- `--destination`: Destination directory containing backup folders (required)
+- `--ignore-deleted`: Ignore files that would be cleaned up by `delete_by_filename.py` script (files starting with `._` and < 4KB)
+- `--log`: Path to log file (optional)
+- `--report`: Path to report file (optional)
+- `--verbose`: Enable verbose/debug logging
+
+### How It Works
+
+1. **Scans source folders**: Parses folder names in "Month Day, Year" format (e.g., "September 10, 2022")
+2. **Scans destination folders**: Parses folder names in "YYYY-MM-DD" format (e.g., "2022-09-10")
+3. **Matches by date**: Groups folders by their date and matches source to destination folders
+4. **Verifies files**: Checks that all source files exist in destination folders with matching sizes
+5. **Generates report**: Produces a detailed report of verification results
+
+### Report Contents
+
+The verification report includes:
+
+- **Summary statistics**: Number of folders checked, matched, total files scanned
+- **Folder details**: File counts per folder and match status
+- **Missing files**: List of files not found in destination or with size mismatches
+- **Unmatched folders**: Source folders with no matching destination folder
+
+### Example Output
+
+```
+================================================================================
+BACKUP VERIFICATION REPORT
+================================================================================
+
+SUMMARY
+--------------------------------------------------------------------------------
+Folders checked: 5
+Folders fully matched: 4
+Total source files scanned: 127
+Total destination files scanned: 125
+Missing or mismatched files: 2
+
+FOLDER DETAILS
+--------------------------------------------------------------------------------
+Date: 2022-09-10
+  Source: September 10, 2022
+  Destination: 2022-09-10
+  Source files: 25
+  Destination files: 25
+  Missing files: 0
+  Status: ✓ MATCHED
+...
+```
+
+### Notes
+
+- The script matches folders by date, so source folders like "September 10, 2022" will match destination folders like "2022-09-10"
+- Files are verified by both filename and size to detect corruption or incomplete copies
+- The script exits with code 0 if all files are verified, or code 1 if issues are found (useful for automation)
+- Month names in source folders are case-insensitive and support abbreviations
+- The `--ignore-deleted` option is useful when source folders contain system files that were intentionally cleaned up in the destination
+
+### Programmatic Usage
+
+The script can also be used as a module for programmatic access to parsing functions:
 
 ```python
 from verify_backup import parse_source_folder_name, parse_destination_folder_name
@@ -274,13 +336,6 @@ date, desc = parse_destination_folder_name("2022-09-10")
 date, desc = parse_destination_folder_name("2022-09-10_CrescentPark-SurreyBC")
 # Returns: (datetime(2022, 9, 10), "CrescentPark-SurreyBC")
 ```
-
-### Notes
-
-- Month names are case-insensitive
-- Supports both full month names and abbreviations (e.g., "Jan", "January")
-- Returns `(None, None)` for invalid or unparseable folder names
-- Validates dates (e.g., rejects February 30)
 
 ---
 
