@@ -16,6 +16,7 @@ from verify_integrity import (
     compute_hash,
     index_files,
     parse_exclude_extensions,
+    verify_files,
 )
 
 
@@ -125,3 +126,70 @@ def test_index_files_updates_on_change_and_tracks_unchanged(tmp_path: Path):
         report_path=report_path,
     )
     assert third["stats"]["unchanged"] == 1
+
+
+def test_verify_files_reports_mismatch_and_untracked(tmp_path: Path):
+    root = tmp_path / "root"
+    db_path = tmp_path / "integrity.db"
+    report_path = tmp_path / "report.json"
+
+    tracked_path = root / "tracked.txt"
+    _write_file(tracked_path, b"original")
+    _write_file(root / "stable.txt", b"stable")
+
+    index_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+
+    _write_file(tracked_path, b"changed")
+    untracked_path = root / "new.txt"
+    _write_file(untracked_path, b"new")
+
+    report = verify_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+
+    stats = report["stats"]
+    assert stats["mismatched"] == 1
+    assert stats["verified"] == 1
+    assert stats["untracked"] == 1
+    assert stats["missing"] == 0
+
+    mismatch_paths = {item["path"] for item in report["mismatched"]}
+    assert mismatch_paths == {str(tracked_path)}
+    untracked_paths = {item["path"] for item in report["untracked"]}
+    assert untracked_paths == {str(untracked_path)}
+
+
+def test_verify_files_reports_missing(tmp_path: Path):
+    root = tmp_path / "root"
+    db_path = tmp_path / "integrity.db"
+    report_path = tmp_path / "report.json"
+    missing_path = root / "gone.txt"
+
+    _write_file(missing_path, b"data")
+    index_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+
+    missing_path.unlink()
+
+    report = verify_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+
+    stats = report["stats"]
+    assert stats["missing"] == 1
+    assert report["missing"][0]["path"] == str(missing_path)
