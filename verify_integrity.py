@@ -105,6 +105,24 @@ def connect_database(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def open_database_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open the database in read-only mode."""
+    if not db_path.exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def is_under_root(file_path: Path, root: Path) -> bool:
+    """Return True if file_path is under root."""
+    try:
+        file_path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def build_report(
     root: Path,
     db_path: Path,
@@ -113,9 +131,8 @@ def build_report(
     stats: Dict[str, int],
     run_started: int,
     run_finished: int,
-    added: Optional[List[Dict[str, object]]],
-    updated: Optional[List[Dict[str, object]]],
-    errors: Optional[List[Dict[str, object]]],
+    mode: str,
+    details: Optional[Dict[str, object]],
 ) -> Dict[str, object]:
     """Build JSON-compatible report."""
     report: Dict[str, object] = {
@@ -125,15 +142,12 @@ def build_report(
         "root": str(root),
         "db": str(db_path),
         "hash_algo": hash_algo,
+        "mode": mode,
         "exclude_exts": sorted(exclude_exts),
         "stats": stats,
     }
-    if added is not None:
-        report["added"] = added
-    if updated is not None:
-        report["updated"] = updated
-    if errors is not None:
-        report["errors"] = errors
+    if details:
+        report.update(details)
     return report
 
 
@@ -257,6 +271,13 @@ def index_files(
         conn.close()
 
     run_finished = int(time.time())
+    details: Dict[str, object] = {}
+    if added is not None:
+        details["added"] = added
+    if updated is not None:
+        details["updated"] = updated
+    if errors is not None:
+        details["errors"] = errors
     report = build_report(
         root=root,
         db_path=db_path,
@@ -265,9 +286,155 @@ def index_files(
         stats=stats,
         run_started=run_started,
         run_finished=run_finished,
-        added=added,
-        updated=updated,
-        errors=errors,
+        mode="index",
+        details=details,
+    )
+    return report
+
+
+def verify_files(
+    root: Path,
+    db_path: Path,
+    exclude_exts: Set[str],
+    report_path: Optional[Path],
+) -> Dict[str, object]:
+    """Verify files by comparing stored hashes against current hashes."""
+    stats = {
+        "scanned": 0,
+        "excluded": 0,
+        "verified": 0,
+        "mismatched": 0,
+        "missing": 0,
+        "untracked": 0,
+        "errors": 0,
+        "db_entries": 0,
+    }
+    include_details = report_path is not None
+    mismatched: Optional[List[Dict[str, object]]] = [] if include_details else None
+    missing: Optional[List[Dict[str, object]]] = [] if include_details else None
+    untracked: Optional[List[Dict[str, object]]] = [] if include_details else None
+    errors: Optional[List[Dict[str, object]]] = [] if include_details else None
+
+    run_started = int(time.time())
+    excluded_paths = {str(db_path.resolve())}
+    if report_path:
+        excluded_paths.add(str(report_path.resolve()))
+
+    conn = open_database_readonly(db_path)
+    try:
+        stats["db_entries"] = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+        for file_path in iter_files(root):
+            path_str = str(file_path)
+            if path_str in excluded_paths:
+                stats["excluded"] += 1
+                continue
+            if file_path.suffix.lower() in exclude_exts:
+                stats["excluded"] += 1
+                continue
+
+            stats["scanned"] += 1
+            try:
+                file_stat = file_path.stat()
+            except OSError as exc:
+                stats["errors"] += 1
+                logging.warning(f"Failed to stat {file_path}: {exc}")
+                if errors is not None:
+                    errors.append({"path": path_str, "error": str(exc)})
+                continue
+
+            row = conn.execute(
+                "SELECT hash, hash_algo FROM files WHERE path = ?",
+                (path_str,),
+            ).fetchone()
+
+            if not row:
+                stats["untracked"] += 1
+                if untracked is not None:
+                    untracked.append(
+                        {
+                            "path": path_str,
+                            "size": file_stat.st_size,
+                            "mtime_ns": file_stat.st_mtime_ns,
+                        }
+                    )
+                continue
+
+            if row["hash_algo"] != DEFAULT_HASH_ALGO:
+                stats["errors"] += 1
+                logging.warning(
+                    f"Unsupported hash algorithm for {file_path}: {row['hash_algo']}"
+                )
+                if errors is not None:
+                    errors.append(
+                        {
+                            "path": path_str,
+                            "error": f"Unsupported hash algorithm: {row['hash_algo']}",
+                        }
+                    )
+                continue
+
+            try:
+                digest = compute_hash(file_path)
+            except OSError as exc:
+                stats["errors"] += 1
+                logging.warning(f"Failed to hash {file_path}: {exc}")
+                if errors is not None:
+                    errors.append({"path": path_str, "error": str(exc)})
+                continue
+
+            if digest == row["hash"]:
+                stats["verified"] += 1
+            else:
+                stats["mismatched"] += 1
+                if mismatched is not None:
+                    mismatched.append(
+                        {
+                            "path": path_str,
+                            "size": file_stat.st_size,
+                            "mtime_ns": file_stat.st_mtime_ns,
+                            "expected_hash": row["hash"],
+                            "actual_hash": digest,
+                        }
+                    )
+
+        for row in conn.execute("SELECT path FROM files"):
+            record_path = Path(row["path"])
+            if not is_under_root(record_path, root):
+                continue
+            if record_path.suffix.lower() in exclude_exts:
+                continue
+            record_str = str(record_path)
+            if record_str in excluded_paths:
+                continue
+            if not record_path.exists():
+                stats["missing"] += 1
+                if missing is not None:
+                    missing.append({"path": record_str})
+    finally:
+        conn.close()
+
+    run_finished = int(time.time())
+    details: Dict[str, object] = {}
+    if mismatched is not None:
+        details["mismatched"] = mismatched
+    if missing is not None:
+        details["missing"] = missing
+    if untracked is not None:
+        details["untracked"] = untracked
+    if errors is not None:
+        details["errors"] = errors
+
+    report = build_report(
+        root=root,
+        db_path=db_path,
+        hash_algo=DEFAULT_HASH_ALGO,
+        exclude_exts=exclude_exts,
+        stats=stats,
+        run_started=run_started,
+        run_finished=run_finished,
+        mode="verify",
+        details=details,
     )
     return report
 
@@ -295,6 +462,9 @@ Examples:
 
   # Exclude specific file types
   python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db --report report.json
+
+  # Verify files against the stored hashes
+  python verify_integrity.py verify --root /path/to/photos --db integrity.db --report verify.json
         """,
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -337,6 +507,44 @@ Examples:
         help='Enable verbose logging',
     )
 
+    verify_parser = subparsers.add_parser(
+        'verify',
+        help='Verify files by comparing stored hashes to current hashes',
+    )
+    verify_parser.add_argument(
+        '--root',
+        type=Path,
+        required=True,
+        help='Root directory to scan recursively',
+    )
+    verify_parser.add_argument(
+        '--db',
+        type=Path,
+        default=Path(DEFAULT_DB_NAME),
+        help=f'Path to SQLite database (default: {DEFAULT_DB_NAME})',
+    )
+    verify_parser.add_argument(
+        '--exclude-ext',
+        action='append',
+        default=[],
+        help='File extensions to exclude (comma-separated or repeatable)',
+    )
+    verify_parser.add_argument(
+        '--report',
+        type=Path,
+        help='Path to JSON report file (optional)',
+    )
+    verify_parser.add_argument(
+        '--log',
+        type=Path,
+        help='Path to log file (optional)',
+    )
+    verify_parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Enable verbose logging',
+    )
+
     args = parser.parse_args()
 
     setup_logging(getattr(args, 'log', None), getattr(args, 'verbose', False))
@@ -358,6 +566,34 @@ Examples:
             report_path=args.report,
         )
         write_report(report, args.report)
+        sys.exit(0)
+
+    if args.command == 'verify':
+        root = args.root.resolve()
+        if not root.exists():
+            logging.error(f"Root directory does not exist: {root}")
+            sys.exit(1)
+        if not root.is_dir():
+            logging.error(f"Root path is not a directory: {root}")
+            sys.exit(1)
+
+        exclude_exts = parse_exclude_extensions(args.exclude_ext)
+        try:
+            report = verify_files(
+                root=root,
+                db_path=args.db,
+                exclude_exts=exclude_exts,
+                report_path=args.report,
+            )
+        except FileNotFoundError as exc:
+            logging.error(str(exc))
+            sys.exit(1)
+
+        write_report(report, args.report)
+
+        stats = report.get("stats", {})
+        if stats.get("mismatched", 0) or stats.get("missing", 0) or stats.get("errors", 0):
+            sys.exit(1)
         sys.exit(0)
 
 

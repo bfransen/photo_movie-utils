@@ -347,6 +347,7 @@ them in a local SQLite database. Outputs a JSON report.
 ### Features
 
 - **Incremental hashing**: Only new or changed files are hashed
+- **Integrity verification**: Re-hash files and compare against stored hashes
 - **SQLite storage**: Stores path, size, mtime, hash, and last_seen
 - **Exclude file types**: Skip file extensions you do not want to track
 - **JSON report**: Summary output to stdout or a report file
@@ -359,12 +360,16 @@ python verify_integrity.py index --root /path/to/photos --db integrity.db --repo
 
 # Exclude file types by extension
 python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db --report report.json
+
+# Verify files against stored hashes
+python verify_integrity.py verify --root /path/to/photos --db integrity.db --report verify.json
 ```
 
 ### Notes
 
 - The script does not follow symlinks.
-- Use `--report` if you want a detailed JSON file with added/updated entries.
+- Use `--report` if you want a detailed JSON file with added/updated or mismatched entries.
+- Verification re-hashes files, so expect it to take time on large collections.
 
 ---
 
