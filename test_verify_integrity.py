@@ -235,3 +235,94 @@ def test_verify_files_handles_moved_files_by_hash(tmp_path: Path):
     assert stats["missing"] == 0
     # New path should NOT be marked as untracked (because hash matched)
     assert stats["untracked"] == 0
+
+
+def test_verify_files_cross_root_backup(tmp_path: Path):
+    """Test --cross-root: index source, verify backup (different root)."""
+    source = tmp_path / "source"
+    backup = tmp_path / "backup"
+    db_path = tmp_path / "integrity.db"
+    report_path = tmp_path / "report.json"
+
+    _write_file(source / "folder_a" / "f1.txt", b"alpha")
+    _write_file(source / "folder_a" / "f2.txt", b"beta")
+    _write_file(source / "folder_b" / "f3.txt", b"gamma")
+
+    index_files(
+        root=source,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+
+    # Backup has same content, different structure (e.g. date-based folders)
+    _write_file(backup / "2024-01-10" / "f1.txt", b"alpha")
+    _write_file(backup / "2024-01-10" / "f2.txt", b"beta")
+    _write_file(backup / "2024-01-15" / "f3.txt", b"gamma")
+
+    report = verify_files(
+        root=backup,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+        cross_root=True,
+    )
+
+    stats = report["stats"]
+    assert stats["verified"] == 3
+    assert stats["missing"] == 0
+    assert stats["untracked"] == 0
+    assert report.get("cross_root") is True
+
+    # Remove one file from backup; verify should report 1 missing
+    (backup / "2024-01-10" / "f2.txt").unlink()
+    report2 = verify_files(
+        root=backup,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+        cross_root=True,
+    )
+    assert report2["stats"]["missing"] == 1
+    assert "hash" in report2["missing"][0]
+    assert report2["missing"][0]["hash"] == hashlib.sha256(b"beta").hexdigest()
+
+
+def test_ignore_deleted_prefix_and_size(tmp_path: Path):
+    """Test --ignore-deleted: ._* files < 4KB are excluded from index and verify."""
+    root = tmp_path / "root"
+    db_path = tmp_path / "integrity.db"
+    report_path = tmp_path / "report.json"
+
+    _write_file(root / "real.txt", b"content")
+    _write_file(root / "._small", b"x" * 100)       # ._* and < 4500
+    _write_file(root / "._big", b"x" * 5000)        # ._* but >= 4500, should be indexed
+    _write_file(root / "normal_small.txt", b"y")    # not ._*, should be indexed
+
+    report = index_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+        ignore_deleted=True,
+    )
+
+    assert report["stats"]["excluded"] == 1
+    assert report["stats"]["hashed_new"] == 3
+    assert report.get("ignore_deleted") is True
+    added_paths = {item["path"] for item in report["added"]}
+    assert str(root / "._small") not in added_paths
+    assert str(root / "._big") in added_paths
+    assert str(root / "real.txt") in added_paths
+    assert str(root / "normal_small.txt") in added_paths
+
+    verify_report = verify_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+        ignore_deleted=True,
+    )
+    assert verify_report["stats"]["verified"] == 3
+    assert verify_report["stats"]["excluded"] == 1
+    assert verify_report["stats"]["missing"] == 0

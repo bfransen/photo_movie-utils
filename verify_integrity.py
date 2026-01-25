@@ -54,6 +54,20 @@ def parse_exclude_extensions(exclude_args: List[str]) -> Set[str]:
     return extensions
 
 
+def should_ignore_file(file_path: Path, size: Optional[int] = None) -> bool:
+    """Ignore files matching delete_by_filename criteria (prefix + size).
+
+    Files are ignored if they start with '._' and are 4KB or smaller (< 4500 bytes).
+    """
+    try:
+        if not file_path.name.startswith("._"):
+            return False
+        s = size if size is not None else file_path.stat().st_size
+        return s < 4500
+    except (OSError, AttributeError):
+        return False
+
+
 def iter_files(root: Path) -> Iterable[Path]:
     """Iterate through files under root without following symlinks."""
     stack = [root]
@@ -158,7 +172,8 @@ def index_files(
     root: Path,
     db_path: Path,
     exclude_exts: Set[str],
-    report_path: Optional[Path],
+    report_path: Path,
+    ignore_deleted: bool = False,
 ) -> Dict[str, object]:
     """Scan files, hash new or changed entries, and update the database."""
     stats = {
@@ -169,15 +184,15 @@ def index_files(
         "unchanged": 0,
         "errors": 0,
     }
-    include_details = report_path is not None
-    added: Optional[List[Dict[str, object]]] = [] if include_details else None
-    updated: Optional[List[Dict[str, object]]] = [] if include_details else None
-    errors: Optional[List[Dict[str, object]]] = [] if include_details else None
+    added: List[Dict[str, object]] = []
+    updated: List[Dict[str, object]] = []
+    errors: List[Dict[str, object]] = []
 
     run_started = int(time.time())
-    excluded_paths = {str(db_path.resolve())}
-    if report_path:
-        excluded_paths.add(str(report_path.resolve()))
+    excluded_paths = {
+        str(db_path.resolve()),
+        str(report_path.resolve()),
+    }
 
     conn = connect_database(db_path)
     processed_since_commit = 0
@@ -198,12 +213,15 @@ def index_files(
             except OSError as exc:
                 stats["errors"] += 1
                 logging.warning(f"Failed to stat {file_path}: {exc}")
-                if errors is not None:
-                    errors.append({"path": path_str, "error": str(exc)})
+                errors.append({"path": path_str, "error": str(exc)})
                 continue
 
             size = file_stat.st_size
             mtime_ns = file_stat.st_mtime_ns
+            if ignore_deleted and should_ignore_file(file_path, size):
+                stats["excluded"] += 1
+                continue
+
             filename = file_path.name
             existing = conn.execute(
                 "SELECT size, mtime_ns, hash FROM files WHERE path = ?",
@@ -222,33 +240,30 @@ def index_files(
                 except OSError as exc:
                     stats["errors"] += 1
                     logging.warning(f"Failed to hash {file_path}: {exc}")
-                    if errors is not None:
-                        errors.append({"path": path_str, "error": str(exc)})
+                    errors.append({"path": path_str, "error": str(exc)})
                     continue
 
                 if existing:
                     stats["hashed_updated"] += 1
-                    if updated is not None:
-                        updated.append(
-                            {
-                                "path": path_str,
-                                "size": size,
-                                "mtime_ns": mtime_ns,
-                                "hash": digest,
-                                "previous_hash": existing["hash"],
-                            }
-                        )
+                    updated.append(
+                        {
+                            "path": path_str,
+                            "size": size,
+                            "mtime_ns": mtime_ns,
+                            "hash": digest,
+                            "previous_hash": existing["hash"],
+                        }
+                    )
                 else:
                     stats["hashed_new"] += 1
-                    if added is not None:
-                        added.append(
-                            {
-                                "path": path_str,
-                                "size": size,
-                                "mtime_ns": mtime_ns,
-                                "hash": digest,
-                            }
-                        )
+                    added.append(
+                        {
+                            "path": path_str,
+                            "size": size,
+                            "mtime_ns": mtime_ns,
+                            "hash": digest,
+                        }
+                    )
 
                 conn.execute(
                     """
@@ -276,13 +291,13 @@ def index_files(
         conn.close()
 
     run_finished = int(time.time())
-    details: Dict[str, object] = {}
-    if added is not None:
-        details["added"] = added
-    if updated is not None:
-        details["updated"] = updated
-    if errors is not None:
-        details["errors"] = errors
+    details: Dict[str, object] = {
+        "added": added,
+        "updated": updated,
+        "errors": errors,
+    }
+    if ignore_deleted:
+        details["ignore_deleted"] = True
     report = build_report(
         root=root,
         db_path=db_path,
@@ -301,9 +316,15 @@ def verify_files(
     root: Path,
     db_path: Path,
     exclude_exts: Set[str],
-    report_path: Optional[Path],
+    report_path: Path,
+    cross_root: bool = False,
+    ignore_deleted: bool = False,
 ) -> Dict[str, object]:
-    """Verify files by comparing stored hashes against current hashes."""
+    """Verify files by comparing stored hashes against current hashes.
+
+    When cross_root is True, root is a different tree than the indexed one (e.g. backup).
+    Verification is hash-only; "missing" = hashes in DB not seen under root.
+    """
     stats = {
         "scanned": 0,
         "excluded": 0,
@@ -314,16 +335,16 @@ def verify_files(
         "errors": 0,
         "db_entries": 0,
     }
-    include_details = report_path is not None
-    mismatched: Optional[List[Dict[str, object]]] = [] if include_details else None
-    missing: Optional[List[Dict[str, object]]] = [] if include_details else None
-    untracked: Optional[List[Dict[str, object]]] = [] if include_details else None
-    errors: Optional[List[Dict[str, object]]] = [] if include_details else None
+    mismatched: List[Dict[str, object]] = []
+    missing: List[Dict[str, object]] = []
+    untracked: List[Dict[str, object]] = []
+    errors: List[Dict[str, object]] = []
 
     run_started = int(time.time())
-    excluded_paths = {str(db_path.resolve())}
-    if report_path:
-        excluded_paths.add(str(report_path.resolve()))
+    excluded_paths = {
+        str(db_path.resolve()),
+        str(report_path.resolve()),
+    }
 
     conn = open_database_readonly(db_path)
     try:
@@ -349,8 +370,11 @@ def verify_files(
             except OSError as exc:
                 stats["errors"] += 1
                 logging.warning(f"Failed to stat {file_path}: {exc}")
-                if errors is not None:
-                    errors.append({"path": path_str, "error": str(exc)})
+                errors.append({"path": path_str, "error": str(exc)})
+                continue
+
+            if ignore_deleted and should_ignore_file(file_path, file_stat.st_size):
+                stats["excluded"] += 1
                 continue
 
             # Compute hash first for hash-based matching
@@ -359,8 +383,7 @@ def verify_files(
             except OSError as exc:
                 stats["errors"] += 1
                 logging.warning(f"Failed to hash {file_path}: {exc}")
-                if errors is not None:
-                    errors.append({"path": path_str, "error": str(exc)})
+                errors.append({"path": path_str, "error": str(exc)})
                 continue
 
             filename = file_path.name
@@ -402,28 +425,26 @@ def verify_files(
                 if row_by_path["hash"] != digest:
                     # Path matches but hash doesn't - file was modified
                     stats["mismatched"] += 1
-                    if mismatched is not None:
-                        mismatched.append(
-                            {
-                                "path": path_str,
-                                "size": file_stat.st_size,
-                                "mtime_ns": file_stat.st_mtime_ns,
-                                "expected_hash": row_by_path["hash"],
-                                "actual_hash": digest,
-                            }
-                        )
-                    continue
-
-            if not row:
-                stats["untracked"] += 1
-                if untracked is not None:
-                    untracked.append(
+                    mismatched.append(
                         {
                             "path": path_str,
                             "size": file_stat.st_size,
                             "mtime_ns": file_stat.st_mtime_ns,
+                            "expected_hash": row_by_path["hash"],
+                            "actual_hash": digest,
                         }
                     )
+                    continue
+
+            if not row:
+                stats["untracked"] += 1
+                untracked.append(
+                    {
+                        "path": path_str,
+                        "size": file_stat.st_size,
+                        "mtime_ns": file_stat.st_mtime_ns,
+                    }
+                )
                 continue
 
             if row["hash_algo"] != DEFAULT_HASH_ALGO:
@@ -431,13 +452,12 @@ def verify_files(
                 logging.warning(
                     f"Unsupported hash algorithm for {file_path}: {row['hash_algo']}"
                 )
-                if errors is not None:
-                    errors.append(
-                        {
-                            "path": path_str,
-                            "error": f"Unsupported hash algorithm: {row['hash_algo']}",
-                        }
-                    )
+                errors.append(
+                    {
+                        "path": path_str,
+                        "error": f"Unsupported hash algorithm: {row['hash_algo']}",
+                    }
+                )
                 continue
 
             # Hash matches (already computed above)
@@ -447,40 +467,67 @@ def verify_files(
                 logging.debug(f"File moved: {row['path']} -> {path_str}")
 
         # Check for missing files: entries in DB that weren't found
-        for row in conn.execute("SELECT path, hash FROM files"):
-            record_path = Path(row["path"])
-            if not is_under_root(record_path, root):
-                continue
-            if record_path.suffix.lower() in exclude_exts:
-                continue
-            record_str = str(record_path)
-            if record_str in excluded_paths:
-                continue
-            
-            # Skip if this hash was already verified (file was moved, not missing)
-            if row["hash"] in verified_hashes:
-                continue
-            # Skip if this path was already verified
-            if record_str in verified_paths:
-                continue
-            
-            if not record_path.exists():
+        def _db_row_ignored(row: object) -> bool:
+            if not ignore_deleted:
+                return False
+            r = row
+            return (
+                Path(r["path"]).name.startswith("._")
+                and r["size"] < 4500
+            )
+
+        if cross_root:
+            # Hash-based missing: DB was built from different root (e.g. source).
+            # Missing = hashes in DB not seen when scanning root (e.g. backup).
+            reported_missing_hashes: Set[str] = set()
+            for row in conn.execute("SELECT path, hash, size FROM files"):
+                if _db_row_ignored(row):
+                    continue
+                record_path = Path(row["path"])
+                if record_path.suffix.lower() in exclude_exts:
+                    continue
+                record_str = str(record_path)
+                if record_str in excluded_paths:
+                    continue
+                if row["hash"] in verified_hashes or record_str in verified_paths:
+                    continue
+                if row["hash"] in reported_missing_hashes:
+                    continue
+                reported_missing_hashes.add(row["hash"])
                 stats["missing"] += 1
-                if missing is not None:
+                missing.append({"path": record_str, "hash": row["hash"]})
+        else:
+            # Path-based missing: same root as index. Missing = in DB, under root, not on disk.
+            for row in conn.execute("SELECT path, hash, size FROM files"):
+                if _db_row_ignored(row):
+                    continue
+                record_path = Path(row["path"])
+                if not is_under_root(record_path, root):
+                    continue
+                if record_path.suffix.lower() in exclude_exts:
+                    continue
+                record_str = str(record_path)
+                if record_str in excluded_paths:
+                    continue
+                if row["hash"] in verified_hashes or record_str in verified_paths:
+                    continue
+                if not record_path.exists():
+                    stats["missing"] += 1
                     missing.append({"path": record_str})
     finally:
         conn.close()
 
     run_finished = int(time.time())
-    details: Dict[str, object] = {}
-    if mismatched is not None:
-        details["mismatched"] = mismatched
-    if missing is not None:
-        details["missing"] = missing
-    if untracked is not None:
-        details["untracked"] = untracked
-    if errors is not None:
-        details["errors"] = errors
+    details: Dict[str, object] = {
+        "mismatched": mismatched,
+        "missing": missing,
+        "untracked": untracked,
+        "errors": errors,
+    }
+    if cross_root:
+        details["cross_root"] = True
+    if ignore_deleted:
+        details["ignore_deleted"] = True
 
     report = build_report(
         root=root,
@@ -496,15 +543,12 @@ def verify_files(
     return report
 
 
-def write_report(report: Dict[str, object], report_path: Optional[Path]) -> None:
-    """Write report to file or stdout."""
+def write_report(report: Dict[str, object], report_path: Path) -> None:
+    """Write report to file."""
     report_json = json.dumps(report, indent=2, sort_keys=True)
-    if report_path:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(report_json, encoding='utf-8')
-        logging.info(f"Report written to {report_path}")
-    else:
-        print(report_json)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report_json, encoding='utf-8')
+    logging.info(f"Report written to {report_path}")
 
 
 def main() -> None:
@@ -514,14 +558,20 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Build or update the hash database
-  python verify_integrity.py index --root /path/to/photos --db integrity.db --report report.json
+  # Build or update the hash database (report written to report.json by default)
+  python verify_integrity.py index --root /path/to/photos --db integrity.db
 
   # Exclude specific file types
-  python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db --report report.json
+  python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db
 
-  # Verify files against the stored hashes
-  python verify_integrity.py verify --root /path/to/photos --db integrity.db --report verify.json
+  # Ignore ._* files < 4KB (delete_by_filename criteria)
+  python verify_integrity.py index --root /path/to/photos --ignore-deleted
+
+  # Verify files against the stored hashes (report written to verify.json by default)
+  python verify_integrity.py verify --root /path/to/photos --db integrity.db
+
+  # Verify backup: DB was built from source; check backup root has all hashes (--cross-root)
+  python verify_integrity.py verify --root /path/to/backup --db integrity.db --cross-root
         """,
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -551,7 +601,13 @@ Examples:
     index_parser.add_argument(
         '--report',
         type=Path,
-        help='Path to JSON report file (optional)',
+        default=Path('report.json'),
+        help='Path to JSON report file (default: report.json)',
+    )
+    index_parser.add_argument(
+        '--ignore-deleted',
+        action='store_true',
+        help='Ignore ._* files < 4KB (matches delete_by_filename criteria)',
     )
     index_parser.add_argument(
         '--log',
@@ -589,7 +645,19 @@ Examples:
     verify_parser.add_argument(
         '--report',
         type=Path,
-        help='Path to JSON report file (optional)',
+        default=Path('verify.json'),
+        help='Path to JSON report file (default: verify.json)',
+    )
+    verify_parser.add_argument(
+        '--cross-root',
+        action='store_true',
+        help='Verify a different tree (e.g. backup): index was built from source, '
+             'root is backup. Missing = hashes in DB not found under root.',
+    )
+    verify_parser.add_argument(
+        '--ignore-deleted',
+        action='store_true',
+        help='Ignore ._* files < 4KB (matches delete_by_filename criteria)',
     )
     verify_parser.add_argument(
         '--log',
@@ -621,6 +689,7 @@ Examples:
             db_path=args.db,
             exclude_exts=exclude_exts,
             report_path=args.report,
+            ignore_deleted=args.ignore_deleted,
         )
         write_report(report, args.report)
         sys.exit(0)
@@ -641,6 +710,8 @@ Examples:
                 db_path=args.db,
                 exclude_exts=exclude_exts,
                 report_path=args.report,
+                cross_root=args.cross_root,
+                ignore_deleted=args.ignore_deleted,
             )
         except FileNotFoundError as exc:
             logging.error(str(exc))
