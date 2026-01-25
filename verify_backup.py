@@ -322,12 +322,15 @@ def verify_backup(source_path: Path, dest_path: Path,
             results['total_source_files'] += source_file_count
             logging.info(f"    Found {source_file_count} files in source folder")
             
-            # Check each destination folder for this date
+            # Get all destination folders for this date
             dest_folder_list = dest_folders[date]
-            folder_matched = False
+            
+            # Collect all files from all destination folders for this date
+            # Track which destination folder(s) each file is found in
+            all_dest_files: Dict[str, Dict[str, object]] = {}  # filename -> {size, folders: [list of folder paths]}
             
             for dest_folder in dest_folder_list:
-                logging.info(f"    Checking destination folder: {dest_folder.name}")
+                logging.info(f"    Scanning destination folder: {dest_folder.name}")
                 
                 # Get all files in destination folder
                 dest_files = get_files_in_folder(dest_folder, ignore_deleted_files)
@@ -335,48 +338,68 @@ def verify_backup(source_path: Path, dest_path: Path,
                 results['total_dest_files'] += dest_file_count
                 logging.info(f"      Found {dest_file_count} files in destination folder")
                 
-                # Find missing files
-                missing = []
-                for filename, size in source_files.items():
-                    if filename not in dest_files:
-                        missing.append({
-                            'filename': filename,
+                # Merge files into combined dictionary
+                for filename, size in dest_files.items():
+                    if filename not in all_dest_files:
+                        all_dest_files[filename] = {
                             'size': size,
-                            'source_folder': str(src_folder),
-                            'dest_folder': str(dest_folder)
-                        })
-                    elif dest_files[filename] != size:
-                        # File exists but size mismatch
-                        missing.append({
-                            'filename': filename,
-                            'size': size,
-                            'dest_size': dest_files[filename],
-                            'source_folder': str(src_folder),
-                            'dest_folder': str(dest_folder),
-                            'reason': 'Size mismatch'
-                        })
+                            'folders': [str(dest_folder)]
+                        }
+                    else:
+                        # File exists in multiple folders - check if size matches
+                        if all_dest_files[filename]['size'] == size:
+                            all_dest_files[filename]['folders'].append(str(dest_folder))
+                        else:
+                            # Size mismatch - keep the first one but note the conflict
+                            logging.warning(f"      Size mismatch for {filename} across destination folders")
+            
+            # Now check if each source file exists in at least one destination folder
+            missing = []
+            for filename, size in source_files.items():
+                if filename not in all_dest_files:
+                    # File not found in any destination folder
+                    missing.append({
+                        'filename': filename,
+                        'size': size,
+                        'source_folder': str(src_folder),
+                        'reason': 'File not found in any destination folder'
+                    })
+                elif all_dest_files[filename]['size'] != size:
+                    # File exists but size mismatch
+                    missing.append({
+                        'filename': filename,
+                        'size': size,
+                        'dest_size': all_dest_files[filename]['size'],
+                        'source_folder': str(src_folder),
+                        'dest_folders': all_dest_files[filename]['folders'],
+                        'reason': 'Size mismatch'
+                    })
+            
+            if not missing:
+                results['folders_matched'] += 1
+                logging.info(f"    ✓ All files verified across {len(dest_folder_list)} destination folder(s)")
+            else:
+                logging.warning(f"    ✗ {len(missing)} files missing or mismatched")
+                results['missing_files'].extend(missing)
+            
+            # Store folder details for each destination folder
+            for dest_folder in dest_folder_list:
+                dest_files = get_files_in_folder(dest_folder, ignore_deleted_files)
+                dest_file_count = len(dest_files)
                 
-                if not missing:
-                    folder_matched = True
-                    results['folders_matched'] += 1
-                    logging.info(f"      ✓ All files verified in {dest_folder.name}")
-                else:
-                    logging.warning(f"      ✗ {len(missing)} files missing or mismatched in {dest_folder.name}")
-                    results['missing_files'].extend(missing)
+                # Count how many source files are in this specific destination folder
+                files_in_this_dest = sum(1 for filename in source_files.keys() 
+                                        if filename in dest_files and dest_files[filename] == source_files[filename])
                 
-                # Store folder details
                 results['folder_details'].append({
                     'date': date_str,
                     'source_folder': str(src_folder),
                     'dest_folder': str(dest_folder),
                     'source_file_count': source_file_count,
                     'dest_file_count': dest_file_count,
-                    'missing_count': len(missing),
+                    'matched_files_in_dest': files_in_this_dest,
                     'matched': len(missing) == 0
                 })
-            
-            if not folder_matched and dest_folder_list:
-                logging.warning(f"  Source folder {src_folder.name} did not fully match any destination folder")
     
     return results
 

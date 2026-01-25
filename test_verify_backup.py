@@ -707,6 +707,77 @@ def test_verify_backup_multiple_folders(tmp_path):
     assert len(results['missing_files']) == 0
 
 
+def test_verify_backup_multiple_dest_folders_same_date(tmp_path):
+    """Test verification where source folder matches multiple destination folders.
+    
+    Files should be considered found if they exist in at least one destination folder,
+    not all of them.
+    """
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    source.mkdir()
+    dest.mkdir()
+    
+    # Create one source folder and multiple destination folders for the same date
+    (source / "September 10, 2022").mkdir()
+    (dest / "2022-09-10_backup1").mkdir()
+    (dest / "2022-09-10_backup2").mkdir()
+    
+    # Source folder has 3 files
+    (source / "September 10, 2022" / "file1.txt").write_text("content1")
+    (source / "September 10, 2022" / "file2.txt").write_text("content2")
+    (source / "September 10, 2022" / "file3.txt").write_text("content3")
+    
+    # First destination folder has file1 and file2
+    (dest / "2022-09-10_backup1" / "file1.txt").write_text("content1")
+    (dest / "2022-09-10_backup1" / "file2.txt").write_text("content2")
+    
+    # Second destination folder has file2 and file3
+    (dest / "2022-09-10_backup2" / "file2.txt").write_text("content2")
+    (dest / "2022-09-10_backup2" / "file3.txt").write_text("content3")
+    
+    results = verify_backup(source, dest)
+    
+    # All files should be found (file1 in backup1, file2 in both, file3 in backup2)
+    assert results['folders_checked'] == 1
+    assert results['folders_matched'] == 1
+    assert len(results['missing_files']) == 0
+
+
+def test_verify_backup_multiple_dest_folders_missing_file(tmp_path):
+    """Test verification where a file is missing from all destination folders."""
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    source.mkdir()
+    dest.mkdir()
+    
+    # Create one source folder and multiple destination folders for the same date
+    (source / "September 10, 2022").mkdir()
+    (dest / "2022-09-10_backup1").mkdir()
+    (dest / "2022-09-10_backup2").mkdir()
+    
+    # Source folder has 3 files
+    (source / "September 10, 2022" / "file1.txt").write_text("content1")
+    (source / "September 10, 2022" / "file2.txt").write_text("content2")
+    (source / "September 10, 2022" / "file3.txt").write_text("content3")
+    
+    # First destination folder has file1
+    (dest / "2022-09-10_backup1" / "file1.txt").write_text("content1")
+    
+    # Second destination folder has file2
+    (dest / "2022-09-10_backup2" / "file2.txt").write_text("content2")
+    
+    # file3 is missing from both destination folders
+    
+    results = verify_backup(source, dest)
+    
+    # file3 should be reported as missing
+    assert results['folders_checked'] == 1
+    assert results['folders_matched'] == 0
+    assert len(results['missing_files']) == 1
+    assert results['missing_files'][0]['filename'] == 'file3.txt'
+
+
 # Tests for generate_report
 
 
