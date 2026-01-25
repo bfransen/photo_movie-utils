@@ -362,6 +362,7 @@ def verify_backup(source_path: Path, dest_path: Path,
                         'filename': filename,
                         'size': size,
                         'source_folder': str(src_folder),
+                        'dest_folders': [str(folder) for folder in dest_folder_list],
                         'reason': 'File not found in any destination folder'
                     })
                 elif all_dest_files[filename]['size'] != size:
@@ -375,11 +376,12 @@ def verify_backup(source_path: Path, dest_path: Path,
                         'reason': 'Size mismatch'
                     })
             
+            missing_count = len(missing)
             if not missing:
                 results['folders_matched'] += 1
                 logging.info(f"    ✓ All files verified across {len(dest_folder_list)} destination folder(s)")
             else:
-                logging.warning(f"    ✗ {len(missing)} files missing or mismatched")
+                logging.warning(f"    ✗ {missing_count} files missing or mismatched")
                 results['missing_files'].extend(missing)
             
             # Store folder details for each destination folder
@@ -398,7 +400,8 @@ def verify_backup(source_path: Path, dest_path: Path,
                     'source_file_count': source_file_count,
                     'dest_file_count': dest_file_count,
                     'matched_files_in_dest': files_in_this_dest,
-                    'matched': len(missing) == 0
+                    'missing_count': missing_count,
+                    'matched': missing_count == 0
                 })
     
     return results
@@ -429,6 +432,18 @@ def generate_report(results: Dict, report_file: Optional[Path] = None) -> str:
     Returns:
         Report as a string
     """
+    def format_destination_label(missing_detail: Dict) -> str:
+        dest_folder = missing_detail.get('dest_folder')
+        if dest_folder:
+            return Path(dest_folder).name
+        dest_folders = missing_detail.get('dest_folders')
+        if dest_folders:
+            names = [Path(folder).name for folder in dest_folders]
+            if len(names) == 1:
+                return names[0]
+            return ", ".join(names)
+        return "Unknown"
+
     report_lines = []
     report_lines.append("=" * 80)
     report_lines.append("BACKUP VERIFICATION REPORT")
@@ -456,7 +471,7 @@ def generate_report(results: Dict, report_file: Optional[Path] = None) -> str:
             report_lines.append(f"  Destination: {Path(detail['dest_folder']).name}")
             report_lines.append(f"  Source files: {detail['source_file_count']}")
             report_lines.append(f"  Destination files: {detail['dest_file_count']}")
-            report_lines.append(f"  Missing files: {detail['missing_count']}")
+            report_lines.append(f"  Missing files: {detail.get('missing_count', 0)}")
             report_lines.append(f"  Status: {status}")
             report_lines.append("")
     
@@ -467,13 +482,13 @@ def generate_report(results: Dict, report_file: Optional[Path] = None) -> str:
         for missing in results['missing_files']:
             report_lines.append(f"File: {missing['filename']}")
             report_lines.append(f"  Source folder: {Path(missing['source_folder']).name}")
-            report_lines.append(f"  Destination folder: {Path(missing['dest_folder']).name}")
+            report_lines.append(f"  Destination folder: {format_destination_label(missing)}")
             report_lines.append(f"  Source size: {missing['size']:,} bytes")
             if 'dest_size' in missing:
                 report_lines.append(f"  Destination size: {missing['dest_size']:,} bytes")
                 report_lines.append(f"  Reason: {missing.get('reason', 'Size mismatch')}")
             else:
-                report_lines.append(f"  Reason: File not found")
+                report_lines.append(f"  Reason: {missing.get('reason', 'File not found')}")
             report_lines.append("")
     
     # Unmatched folders
