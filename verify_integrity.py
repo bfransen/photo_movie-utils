@@ -93,6 +93,7 @@ def connect_database(db_path: Path) -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
             size INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL,
             hash TEXT NOT NULL,
@@ -102,6 +103,8 @@ def connect_database(db_path: Path) -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_last_seen ON files(last_seen)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)")
     return conn
 
 
@@ -201,6 +204,7 @@ def index_files(
 
             size = file_stat.st_size
             mtime_ns = file_stat.st_mtime_ns
+            filename = file_path.name
             existing = conn.execute(
                 "SELECT size, mtime_ns, hash FROM files WHERE path = ?",
                 (path_str,),
@@ -248,16 +252,17 @@ def index_files(
 
                 conn.execute(
                     """
-                    INSERT INTO files (path, size, mtime_ns, hash, hash_algo, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO files (path, filename, size, mtime_ns, hash, hash_algo, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(path) DO UPDATE SET
+                        filename = excluded.filename,
                         size = excluded.size,
                         mtime_ns = excluded.mtime_ns,
                         hash = excluded.hash,
                         hash_algo = excluded.hash_algo,
                         last_seen = excluded.last_seen
                     """,
-                    (path_str, size, mtime_ns, digest, DEFAULT_HASH_ALGO, run_started),
+                    (path_str, filename, size, mtime_ns, digest, DEFAULT_HASH_ALGO, run_started),
                 )
 
             processed_since_commit += 1
@@ -323,6 +328,11 @@ def verify_files(
     conn = open_database_readonly(db_path)
     try:
         stats["db_entries"] = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        
+        # Track which hashes have been verified (to avoid marking moved files as missing)
+        verified_hashes: Set[str] = set()
+        # Track which paths have been verified (for backwards compatibility)
+        verified_paths: Set[str] = set()
 
         for file_path in iter_files(root):
             path_str = str(file_path)
@@ -343,10 +353,66 @@ def verify_files(
                     errors.append({"path": path_str, "error": str(exc)})
                 continue
 
-            row = conn.execute(
-                "SELECT hash, hash_algo FROM files WHERE path = ?",
+            # Compute hash first for hash-based matching
+            try:
+                digest = compute_hash(file_path)
+            except OSError as exc:
+                stats["errors"] += 1
+                logging.warning(f"Failed to hash {file_path}: {exc}")
+                if errors is not None:
+                    errors.append({"path": path_str, "error": str(exc)})
+                continue
+
+            filename = file_path.name
+            # Try hash-based lookup first (handles moved/renamed files)
+            rows_by_hash = conn.execute(
+                "SELECT path, filename, hash_algo FROM files WHERE hash = ?",
+                (digest,),
+            ).fetchall()
+
+            # Try path-based lookup for backwards compatibility
+            row_by_path = conn.execute(
+                "SELECT path, filename, hash, hash_algo FROM files WHERE path = ?",
                 (path_str,),
             ).fetchone()
+
+            # Determine which row to use
+            row = None
+            matched_by_hash = False
+            if rows_by_hash:
+                # Found by hash - check if filename matches (prefer exact match)
+                for candidate in rows_by_hash:
+                    if candidate["filename"] == filename:
+                        row = candidate
+                        matched_by_hash = True
+                        verified_hashes.add(digest)
+                        verified_paths.add(candidate["path"])
+                        break
+                # If no filename match, use first hash match (file may have been renamed)
+                if not row:
+                    row = rows_by_hash[0]
+                    matched_by_hash = True
+                    verified_hashes.add(digest)
+                    verified_paths.add(row["path"])
+            elif row_by_path:
+                # Found by path (backwards compatibility)
+                row = row_by_path
+                verified_paths.add(path_str)
+                # Check if hash matches
+                if row_by_path["hash"] != digest:
+                    # Path matches but hash doesn't - file was modified
+                    stats["mismatched"] += 1
+                    if mismatched is not None:
+                        mismatched.append(
+                            {
+                                "path": path_str,
+                                "size": file_stat.st_size,
+                                "mtime_ns": file_stat.st_mtime_ns,
+                                "expected_hash": row_by_path["hash"],
+                                "actual_hash": digest,
+                            }
+                        )
+                    continue
 
             if not row:
                 stats["untracked"] += 1
@@ -374,31 +440,14 @@ def verify_files(
                     )
                 continue
 
-            try:
-                digest = compute_hash(file_path)
-            except OSError as exc:
-                stats["errors"] += 1
-                logging.warning(f"Failed to hash {file_path}: {exc}")
-                if errors is not None:
-                    errors.append({"path": path_str, "error": str(exc)})
-                continue
+            # Hash matches (already computed above)
+            stats["verified"] += 1
+            if matched_by_hash and row["path"] != path_str:
+                # File was moved/renamed - log this for information
+                logging.debug(f"File moved: {row['path']} -> {path_str}")
 
-            if digest == row["hash"]:
-                stats["verified"] += 1
-            else:
-                stats["mismatched"] += 1
-                if mismatched is not None:
-                    mismatched.append(
-                        {
-                            "path": path_str,
-                            "size": file_stat.st_size,
-                            "mtime_ns": file_stat.st_mtime_ns,
-                            "expected_hash": row["hash"],
-                            "actual_hash": digest,
-                        }
-                    )
-
-        for row in conn.execute("SELECT path FROM files"):
+        # Check for missing files: entries in DB that weren't found
+        for row in conn.execute("SELECT path, hash FROM files"):
             record_path = Path(row["path"])
             if not is_under_root(record_path, root):
                 continue
@@ -407,6 +456,14 @@ def verify_files(
             record_str = str(record_path)
             if record_str in excluded_paths:
                 continue
+            
+            # Skip if this hash was already verified (file was moved, not missing)
+            if row["hash"] in verified_hashes:
+                continue
+            # Skip if this path was already verified
+            if record_str in verified_paths:
+                continue
+            
             if not record_path.exists():
                 stats["missing"] += 1
                 if missing is not None:

@@ -193,3 +193,45 @@ def test_verify_files_reports_missing(tmp_path: Path):
     stats = report["stats"]
     assert stats["missing"] == 1
     assert report["missing"][0]["path"] == str(missing_path)
+
+
+def test_verify_files_handles_moved_files_by_hash(tmp_path: Path):
+    """Test that verify can find files that have been moved/renamed using hash-based matching."""
+    root = tmp_path / "root"
+    db_path = tmp_path / "integrity.db"
+    report_path = tmp_path / "report.json"
+    
+    # Create file in original location
+    original_path = root / "old_folder" / "photo.jpg"
+    _write_file(original_path, b"photo content")
+    
+    # Index the file
+    index_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+    
+    # Move file to new location (simulating folder rename)
+    new_path = root / "2024-01-15_January_15_2024" / "photo.jpg"
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    new_path.write_bytes(original_path.read_bytes())
+    original_path.unlink()
+    original_path.parent.rmdir()
+    
+    # Verify - should find file by hash even though path changed
+    report = verify_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+    
+    stats = report["stats"]
+    # File should be verified (found by hash)
+    assert stats["verified"] == 1
+    # Original path should NOT be marked as missing (because hash was verified)
+    assert stats["missing"] == 0
+    # New path should NOT be marked as untracked (because hash matched)
+    assert stats["untracked"] == 0
