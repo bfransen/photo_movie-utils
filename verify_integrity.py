@@ -4,6 +4,13 @@ Integrity verification script.
 
 Scans a directory tree, computes SHA-256 hashes for new or changed files,
 and stores results in a local SQLite database.
+
+Commands:
+  index   Build or update the hash DB; only new/changed files are hashed.
+  verify  Re-hash files under --root and compare to stored hashes.
+
+A JSON report is always written (default: report.json for index, verify.json for verify).
+Use --help for full options and examples.
 """
 
 import argparse
@@ -554,24 +561,20 @@ def write_report(report: Dict[str, object], report_path: Path) -> None:
 def main() -> None:
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
-        description='Scan files, hash new or changed entries, and store results in SQLite',
+        description='Index file hashes (index) or verify integrity (verify). '
+                    'Scan with --root; store/compare via SQLite.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Build or update the hash database (report written to report.json by default)
-  python verify_integrity.py index --root /path/to/photos --db integrity.db
+  index:
+    python verify_integrity.py index --root /path/to/photos --db integrity.db
+    python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db
+    python verify_integrity.py index --root /path/to/photos --ignore-deleted
+    python verify_integrity.py index --root /path/to/photos --report my_report.json
 
-  # Exclude specific file types
-  python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db
-
-  # Ignore ._* files < 4KB (delete_by_filename criteria)
-  python verify_integrity.py index --root /path/to/photos --ignore-deleted
-
-  # Verify files against the stored hashes (report written to verify.json by default)
-  python verify_integrity.py verify --root /path/to/photos --db integrity.db
-
-  # Verify backup: DB was built from source; check backup root has all hashes (--cross-root)
-  python verify_integrity.py verify --root /path/to/backup --db integrity.db --cross-root
+  verify:
+    python verify_integrity.py verify --root /path/to/photos --db integrity.db
+    python verify_integrity.py verify --root /path/to/backup --db integrity.db --cross-root
         """,
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -596,13 +599,13 @@ Examples:
         '--exclude-ext',
         action='append',
         default=[],
-        help='File extensions to exclude (comma-separated or repeatable)',
+        help='Extensions to exclude (e.g. .tmp,.db). Comma-separated or repeatable.',
     )
     index_parser.add_argument(
         '--report',
         type=Path,
         default=Path('report.json'),
-        help='Path to JSON report file (default: report.json)',
+        help='JSON report path (default: report.json)',
     )
     index_parser.add_argument(
         '--ignore-deleted',
@@ -612,12 +615,12 @@ Examples:
     index_parser.add_argument(
         '--log',
         type=Path,
-        help='Path to log file (optional)',
+        help='Write log output to this file',
     )
     index_parser.add_argument(
         '--verbose',
         action='store_true',
-        help='Enable verbose logging',
+        help='Enable verbose (debug) logging',
     )
 
     verify_parser = subparsers.add_parser(
@@ -640,13 +643,13 @@ Examples:
         '--exclude-ext',
         action='append',
         default=[],
-        help='File extensions to exclude (comma-separated or repeatable)',
+        help='Extensions to exclude (e.g. .tmp,.db). Comma-separated or repeatable.',
     )
     verify_parser.add_argument(
         '--report',
         type=Path,
         default=Path('verify.json'),
-        help='Path to JSON report file (default: verify.json)',
+        help='JSON report path (default: verify.json)',
     )
     verify_parser.add_argument(
         '--cross-root',
@@ -662,12 +665,12 @@ Examples:
     verify_parser.add_argument(
         '--log',
         type=Path,
-        help='Path to log file (optional)',
+        help='Write log output to this file',
     )
     verify_parser.add_argument(
         '--verbose',
         action='store_true',
-        help='Enable verbose logging',
+        help='Enable verbose (debug) logging',
     )
 
     args = parser.parse_args()

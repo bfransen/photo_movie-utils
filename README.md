@@ -342,7 +342,8 @@ date, desc = parse_destination_folder_name("2022-09-10_CrescentPark-SurreyBC")
 ## verify_integrity.py
 
 Scans a directory tree, computes SHA-256 hashes for new or changed files, and stores
-them in a local SQLite database. Outputs a JSON report.
+them in a local SQLite database. Two subcommands: **index** (build/update the DB) and
+**verify** (compare current hashes to stored ones). A JSON report is always written.
 
 ### Features
 
@@ -350,26 +351,47 @@ them in a local SQLite database. Outputs a JSON report.
 - **Integrity verification**: Re-hash files and compare against stored hashes
 - **SQLite storage**: Stores path, size, mtime, hash, and last_seen
 - **Exclude file types**: Skip file extensions you do not want to track
-- **JSON report**: Summary output to stdout or a report file
+- **JSON report**: Summary and details (added/updated or mismatched/missing/untracked) written to a report file
+
+### Index options
+
+| Option | Description |
+|--------|-------------|
+| `--root` | **(required)** Root directory to scan recursively |
+| `--db` | Path to SQLite database (default: `integrity.db`) |
+| `--report` | Path to JSON report file (default: `report.json`) |
+| `--exclude-ext` | File extensions to exclude, comma-separated or repeatable (e.g. `.tmp`, `.db`) |
+| `--ignore-deleted` | Ignore `._*` files &lt; 4KB (matches delete_by_filename criteria) |
+| `--log` | Write log output to this file |
+| `--verbose` | Enable verbose (debug) logging |
 
 ### Usage
 
 ```bash
-# Index files and write a JSON report
-python verify_integrity.py index --root /path/to/photos --db integrity.db --report report.json
+# Index files (report written to report.json by default)
+python verify_integrity.py index --root /path/to/photos --db integrity.db
+
+# Custom report path
+python verify_integrity.py index --root /path/to/photos --report /path/to/index_report.json
 
 # Exclude file types by extension
-python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db --report report.json
+python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db
 
-# Verify files against stored hashes
-python verify_integrity.py verify --root /path/to/photos --db integrity.db --report verify.json
+# Ignore ._* files < 4KB (delete_by_filename-style)
+python verify_integrity.py index --root /path/to/photos --ignore-deleted
+
+# Verify files against stored hashes (report to verify.json by default)
+python verify_integrity.py verify --root /path/to/photos --db integrity.db
+
+# Verify a backup tree (--cross-root): DB from source, root = backup
+python verify_integrity.py verify --root /path/to/backup --db integrity.db --cross-root
 ```
 
 ### Notes
 
 - The script does not follow symlinks.
-- Use `--report` if you want a detailed JSON file with added/updated or mismatched entries.
-- Verification re-hashes files, so expect it to take time on large collections.
+- A JSON report is always written (default paths: `report.json` for index, `verify.json` for verify). Use `--report` to change the path.
+- Verification re-hashes all relevant files; expect it to take time on large collections.
 
 ---
 
@@ -387,5 +409,6 @@ Or run tests for a specific script:
 pytest test_organize_by_date.py -v
 pytest test_rename_folders.py -v
 pytest test_delete_by_filename.py -v
+pytest test_verify_integrity.py -v
 pytest test_verify_backup.py -v
 ```
