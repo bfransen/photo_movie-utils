@@ -21,15 +21,39 @@ import os
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 DEFAULT_DB_NAME = "integrity.db"
 DEFAULT_HASH_ALGO = "sha256"
 DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024
 COMMIT_EVERY = 250
+DEFAULT_WORKERS = 1
+PROGRESS_EVERY = 1000  # Log progress every N files
+HASH_BATCH_SIZE = 100  # Number of files to batch for parallel hashing
+
+
+@dataclass
+class FileInfo:
+    """Information about a file to be hashed."""
+    path: Path
+    path_str: str
+    filename: str
+    size: int
+    mtime_ns: int
+    existing_hash: Optional[str] = None  # For index: previous hash if updating
+
+
+@dataclass
+class HashResult:
+    """Result of a hash computation."""
+    file_info: FileInfo
+    digest: Optional[str] = None
+    error: Optional[str] = None
 
 
 def setup_logging(log_file: Optional[Path] = None, verbose: bool = False) -> None:
@@ -101,6 +125,15 @@ def compute_hash(file_path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> str:
         for chunk in iter(lambda: handle.read(chunk_size), b''):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def compute_hash_task(file_info: FileInfo) -> HashResult:
+    """Compute hash for a file, returning a HashResult (for use in thread pool)."""
+    try:
+        digest = compute_hash(file_info.path)
+        return HashResult(file_info=file_info, digest=digest)
+    except OSError as exc:
+        return HashResult(file_info=file_info, error=str(exc))
 
 
 def connect_database(db_path: Path) -> sqlite3.Connection:
@@ -175,12 +208,73 @@ def build_report(
     return report
 
 
+def _process_hash_results_index(
+    results: Iterable[HashResult],
+    conn: sqlite3.Connection,
+    run_started: int,
+    stats: Dict[str, int],
+    added: List[Dict[str, object]],
+    updated: List[Dict[str, object]],
+    errors: List[Dict[str, object]],
+) -> int:
+    """Process hash results and write to database. Returns count of processed items."""
+    processed = 0
+    for result in results:
+        fi = result.file_info
+        if result.error:
+            stats["errors"] += 1
+            logging.warning(f"Failed to hash {fi.path}: {result.error}")
+            errors.append({"path": fi.path_str, "error": result.error})
+            continue
+
+        digest = result.digest
+        if fi.existing_hash is not None:
+            stats["hashed_updated"] += 1
+            updated.append(
+                {
+                    "path": fi.path_str,
+                    "size": fi.size,
+                    "mtime_ns": fi.mtime_ns,
+                    "hash": digest,
+                    "previous_hash": fi.existing_hash,
+                }
+            )
+        else:
+            stats["hashed_new"] += 1
+            added.append(
+                {
+                    "path": fi.path_str,
+                    "size": fi.size,
+                    "mtime_ns": fi.mtime_ns,
+                    "hash": digest,
+                }
+            )
+
+        conn.execute(
+            """
+            INSERT INTO files (path, filename, size, mtime_ns, hash, hash_algo, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                filename = excluded.filename,
+                size = excluded.size,
+                mtime_ns = excluded.mtime_ns,
+                hash = excluded.hash,
+                hash_algo = excluded.hash_algo,
+                last_seen = excluded.last_seen
+            """,
+            (fi.path_str, fi.filename, fi.size, fi.mtime_ns, digest, DEFAULT_HASH_ALGO, run_started),
+        )
+        processed += 1
+    return processed
+
+
 def index_files(
     root: Path,
     db_path: Path,
     exclude_exts: Set[str],
     report_path: Path,
     ignore_deleted: bool = False,
+    workers: int = DEFAULT_WORKERS,
 ) -> Dict[str, object]:
     """Scan files, hash new or changed entries, and update the database."""
     stats = {
@@ -203,101 +297,211 @@ def index_files(
 
     conn = connect_database(db_path)
     processed_since_commit = 0
+    total_processed = 0
+    last_progress_log = 0
+
+    def log_progress() -> None:
+        nonlocal last_progress_log
+        if total_processed - last_progress_log >= PROGRESS_EVERY:
+            logging.info(
+                f"Progress: scanned={stats['scanned']}, "
+                f"hashed={stats['hashed_new'] + stats['hashed_updated']}, "
+                f"unchanged={stats['unchanged']}, errors={stats['errors']}"
+            )
+            last_progress_log = total_processed
 
     try:
-        for file_path in iter_files(root):
-            path_str = str(file_path)
-            if path_str in excluded_paths:
-                stats["excluded"] += 1
-                continue
-            if file_path.suffix.lower() in exclude_exts:
-                stats["excluded"] += 1
-                continue
-
-            stats["scanned"] += 1
-            try:
-                file_stat = file_path.stat()
-            except OSError as exc:
-                stats["errors"] += 1
-                logging.warning(f"Failed to stat {file_path}: {exc}")
-                errors.append({"path": path_str, "error": str(exc)})
-                continue
-
-            size = file_stat.st_size
-            mtime_ns = file_stat.st_mtime_ns
-            if ignore_deleted and should_ignore_file(file_path, size):
-                stats["excluded"] += 1
-                continue
-
-            filename = file_path.name
-            existing = conn.execute(
-                "SELECT size, mtime_ns, hash FROM files WHERE path = ?",
-                (path_str,),
-            ).fetchone()
-
-            if existing and existing["size"] == size and existing["mtime_ns"] == mtime_ns:
-                conn.execute(
-                    "UPDATE files SET last_seen = ? WHERE path = ?",
-                    (run_started, path_str),
-                )
-                stats["unchanged"] += 1
-            else:
-                try:
-                    digest = compute_hash(file_path)
-                except OSError as exc:
-                    stats["errors"] += 1
-                    logging.warning(f"Failed to hash {file_path}: {exc}")
-                    errors.append({"path": path_str, "error": str(exc)})
+        if workers <= 1:
+            # Single-threaded path (original behavior)
+            for file_path in iter_files(root):
+                path_str = str(file_path)
+                if path_str in excluded_paths:
+                    stats["excluded"] += 1
+                    continue
+                if file_path.suffix.lower() in exclude_exts:
+                    stats["excluded"] += 1
                     continue
 
-                if existing:
-                    stats["hashed_updated"] += 1
-                    updated.append(
-                        {
-                            "path": path_str,
-                            "size": size,
-                            "mtime_ns": mtime_ns,
-                            "hash": digest,
-                            "previous_hash": existing["hash"],
-                        }
+                stats["scanned"] += 1
+                try:
+                    file_stat = file_path.stat()
+                except OSError as exc:
+                    stats["errors"] += 1
+                    logging.warning(f"Failed to stat {file_path}: {exc}")
+                    errors.append({"path": path_str, "error": str(exc)})
+                    total_processed += 1
+                    log_progress()
+                    continue
+
+                size = file_stat.st_size
+                mtime_ns = file_stat.st_mtime_ns
+                if ignore_deleted and should_ignore_file(file_path, size):
+                    stats["excluded"] += 1
+                    continue
+
+                filename = file_path.name
+                existing = conn.execute(
+                    "SELECT size, mtime_ns, hash FROM files WHERE path = ?",
+                    (path_str,),
+                ).fetchone()
+
+                if existing and existing["size"] == size and existing["mtime_ns"] == mtime_ns:
+                    conn.execute(
+                        "UPDATE files SET last_seen = ? WHERE path = ?",
+                        (run_started, path_str),
                     )
+                    stats["unchanged"] += 1
                 else:
-                    stats["hashed_new"] += 1
-                    added.append(
-                        {
-                            "path": path_str,
-                            "size": size,
-                            "mtime_ns": mtime_ns,
-                            "hash": digest,
-                        }
+                    try:
+                        digest = compute_hash(file_path)
+                    except OSError as exc:
+                        stats["errors"] += 1
+                        logging.warning(f"Failed to hash {file_path}: {exc}")
+                        errors.append({"path": path_str, "error": str(exc)})
+                        total_processed += 1
+                        log_progress()
+                        continue
+
+                    if existing:
+                        stats["hashed_updated"] += 1
+                        updated.append(
+                            {
+                                "path": path_str,
+                                "size": size,
+                                "mtime_ns": mtime_ns,
+                                "hash": digest,
+                                "previous_hash": existing["hash"],
+                            }
+                        )
+                    else:
+                        stats["hashed_new"] += 1
+                        added.append(
+                            {
+                                "path": path_str,
+                                "size": size,
+                                "mtime_ns": mtime_ns,
+                                "hash": digest,
+                            }
+                        )
+
+                    conn.execute(
+                        """
+                        INSERT INTO files (path, filename, size, mtime_ns, hash, hash_algo, last_seen)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(path) DO UPDATE SET
+                            filename = excluded.filename,
+                            size = excluded.size,
+                            mtime_ns = excluded.mtime_ns,
+                            hash = excluded.hash,
+                            hash_algo = excluded.hash_algo,
+                            last_seen = excluded.last_seen
+                        """,
+                        (path_str, filename, size, mtime_ns, digest, DEFAULT_HASH_ALGO, run_started),
                     )
 
-                conn.execute(
-                    """
-                    INSERT INTO files (path, filename, size, mtime_ns, hash, hash_algo, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(path) DO UPDATE SET
-                        filename = excluded.filename,
-                        size = excluded.size,
-                        mtime_ns = excluded.mtime_ns,
-                        hash = excluded.hash,
-                        hash_algo = excluded.hash_algo,
-                        last_seen = excluded.last_seen
-                    """,
-                    (path_str, filename, size, mtime_ns, digest, DEFAULT_HASH_ALGO, run_started),
-                )
+                processed_since_commit += 1
+                total_processed += 1
+                log_progress()
+                if processed_since_commit >= COMMIT_EVERY:
+                    conn.commit()
+                    processed_since_commit = 0
 
-            processed_since_commit += 1
-            if processed_since_commit >= COMMIT_EVERY:
+            if processed_since_commit:
                 conn.commit()
-                processed_since_commit = 0
+        else:
+            # Multi-threaded path
+            logging.info(f"Using {workers} worker threads for hashing")
+            hash_batch: List[FileInfo] = []
 
-        if processed_since_commit:
-            conn.commit()
+            def flush_batch() -> None:
+                nonlocal processed_since_commit, total_processed
+                if not hash_batch:
+                    return
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = [executor.submit(compute_hash_task, fi) for fi in hash_batch]
+                    results = [f.result() for f in as_completed(futures)]
+                processed = _process_hash_results_index(
+                    results, conn, run_started, stats, added, updated, errors
+                )
+                processed_since_commit += processed
+                total_processed += processed
+                log_progress()
+                if processed_since_commit >= COMMIT_EVERY:
+                    conn.commit()
+                    processed_since_commit = 0
+                hash_batch.clear()
+
+            for file_path in iter_files(root):
+                path_str = str(file_path)
+                if path_str in excluded_paths:
+                    stats["excluded"] += 1
+                    continue
+                if file_path.suffix.lower() in exclude_exts:
+                    stats["excluded"] += 1
+                    continue
+
+                stats["scanned"] += 1
+                try:
+                    file_stat = file_path.stat()
+                except OSError as exc:
+                    stats["errors"] += 1
+                    logging.warning(f"Failed to stat {file_path}: {exc}")
+                    errors.append({"path": path_str, "error": str(exc)})
+                    total_processed += 1
+                    log_progress()
+                    continue
+
+                size = file_stat.st_size
+                mtime_ns = file_stat.st_mtime_ns
+                if ignore_deleted and should_ignore_file(file_path, size):
+                    stats["excluded"] += 1
+                    continue
+
+                filename = file_path.name
+                existing = conn.execute(
+                    "SELECT size, mtime_ns, hash FROM files WHERE path = ?",
+                    (path_str,),
+                ).fetchone()
+
+                if existing and existing["size"] == size and existing["mtime_ns"] == mtime_ns:
+                    conn.execute(
+                        "UPDATE files SET last_seen = ? WHERE path = ?",
+                        (run_started, path_str),
+                    )
+                    stats["unchanged"] += 1
+                    processed_since_commit += 1
+                    total_processed += 1
+                    log_progress()
+                    if processed_since_commit >= COMMIT_EVERY:
+                        conn.commit()
+                        processed_since_commit = 0
+                else:
+                    # Queue for hashing
+                    existing_hash = existing["hash"] if existing else None
+                    hash_batch.append(FileInfo(
+                        path=file_path,
+                        path_str=path_str,
+                        filename=filename,
+                        size=size,
+                        mtime_ns=mtime_ns,
+                        existing_hash=existing_hash,
+                    ))
+                    if len(hash_batch) >= HASH_BATCH_SIZE:
+                        flush_batch()
+
+            # Flush remaining batch
+            flush_batch()
+            if processed_since_commit:
+                conn.commit()
     finally:
         conn.close()
 
     run_finished = int(time.time())
+    logging.info(
+        f"Completed: scanned={stats['scanned']}, "
+        f"hashed_new={stats['hashed_new']}, hashed_updated={stats['hashed_updated']}, "
+        f"unchanged={stats['unchanged']}, errors={stats['errors']}"
+    )
     details: Dict[str, object] = {
         "added": added,
         "updated": updated,
@@ -305,6 +509,8 @@ def index_files(
     }
     if ignore_deleted:
         details["ignore_deleted"] = True
+    if workers > 1:
+        details["workers"] = workers
     report = build_report(
         root=root,
         db_path=db_path,
@@ -319,6 +525,106 @@ def index_files(
     return report
 
 
+def _process_hash_result_verify(
+    result: HashResult,
+    conn: sqlite3.Connection,
+    stats: Dict[str, int],
+    mismatched: List[Dict[str, object]],
+    untracked: List[Dict[str, object]],
+    errors: List[Dict[str, object]],
+    verified_hashes: Set[str],
+    verified_paths: Set[str],
+) -> None:
+    """Process a single hash result for verification."""
+    fi = result.file_info
+    if result.error:
+        stats["errors"] += 1
+        logging.warning(f"Failed to hash {fi.path}: {result.error}")
+        errors.append({"path": fi.path_str, "error": result.error})
+        return
+
+    digest = result.digest
+    filename = fi.filename
+
+    # Try hash-based lookup first (handles moved/renamed files)
+    rows_by_hash = conn.execute(
+        "SELECT path, filename, hash_algo FROM files WHERE hash = ?",
+        (digest,),
+    ).fetchall()
+
+    # Try path-based lookup for backwards compatibility
+    row_by_path = conn.execute(
+        "SELECT path, filename, hash, hash_algo FROM files WHERE path = ?",
+        (fi.path_str,),
+    ).fetchone()
+
+    # Determine which row to use
+    row = None
+    matched_by_hash = False
+    if rows_by_hash:
+        # Found by hash - check if filename matches (prefer exact match)
+        for candidate in rows_by_hash:
+            if candidate["filename"] == filename:
+                row = candidate
+                matched_by_hash = True
+                verified_hashes.add(digest)
+                verified_paths.add(candidate["path"])
+                break
+        # If no filename match, use first hash match (file may have been renamed)
+        if not row:
+            row = rows_by_hash[0]
+            matched_by_hash = True
+            verified_hashes.add(digest)
+            verified_paths.add(row["path"])
+    elif row_by_path:
+        # Found by path (backwards compatibility)
+        row = row_by_path
+        verified_paths.add(fi.path_str)
+        # Check if hash matches
+        if row_by_path["hash"] != digest:
+            # Path matches but hash doesn't - file was modified
+            stats["mismatched"] += 1
+            mismatched.append(
+                {
+                    "path": fi.path_str,
+                    "size": fi.size,
+                    "mtime_ns": fi.mtime_ns,
+                    "expected_hash": row_by_path["hash"],
+                    "actual_hash": digest,
+                }
+            )
+            return
+
+    if not row:
+        stats["untracked"] += 1
+        untracked.append(
+            {
+                "path": fi.path_str,
+                "size": fi.size,
+                "mtime_ns": fi.mtime_ns,
+            }
+        )
+        return
+
+    if row["hash_algo"] != DEFAULT_HASH_ALGO:
+        stats["errors"] += 1
+        logging.warning(
+            f"Unsupported hash algorithm for {fi.path}: {row['hash_algo']}"
+        )
+        errors.append(
+            {
+                "path": fi.path_str,
+                "error": f"Unsupported hash algorithm: {row['hash_algo']}",
+            }
+        )
+        return
+
+    # Hash matches
+    stats["verified"] += 1
+    if matched_by_hash and row["path"] != fi.path_str:
+        logging.debug(f"File moved: {row['path']} -> {fi.path_str}")
+
+
 def verify_files(
     root: Path,
     db_path: Path,
@@ -326,6 +632,7 @@ def verify_files(
     report_path: Path,
     cross_root: bool = False,
     ignore_deleted: bool = False,
+    workers: int = DEFAULT_WORKERS,
 ) -> Dict[str, object]:
     """Verify files by comparing stored hashes against current hashes.
 
@@ -354,6 +661,19 @@ def verify_files(
     }
 
     conn = open_database_readonly(db_path)
+    total_processed = 0
+    last_progress_log = 0
+
+    def log_progress() -> None:
+        nonlocal last_progress_log
+        if total_processed - last_progress_log >= PROGRESS_EVERY:
+            logging.info(
+                f"Progress: scanned={stats['scanned']}, "
+                f"verified={stats['verified']}, mismatched={stats['mismatched']}, "
+                f"errors={stats['errors']}"
+            )
+            last_progress_log = total_processed
+
     try:
         stats["db_entries"] = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         
@@ -362,116 +682,189 @@ def verify_files(
         # Track which paths have been verified (for backwards compatibility)
         verified_paths: Set[str] = set()
 
-        for file_path in iter_files(root):
-            path_str = str(file_path)
-            if path_str in excluded_paths:
-                stats["excluded"] += 1
-                continue
-            if file_path.suffix.lower() in exclude_exts:
-                stats["excluded"] += 1
-                continue
+        if workers <= 1:
+            # Single-threaded path (original behavior)
+            for file_path in iter_files(root):
+                path_str = str(file_path)
+                if path_str in excluded_paths:
+                    stats["excluded"] += 1
+                    continue
+                if file_path.suffix.lower() in exclude_exts:
+                    stats["excluded"] += 1
+                    continue
 
-            stats["scanned"] += 1
-            try:
-                file_stat = file_path.stat()
-            except OSError as exc:
-                stats["errors"] += 1
-                logging.warning(f"Failed to stat {file_path}: {exc}")
-                errors.append({"path": path_str, "error": str(exc)})
-                continue
+                stats["scanned"] += 1
+                try:
+                    file_stat = file_path.stat()
+                except OSError as exc:
+                    stats["errors"] += 1
+                    logging.warning(f"Failed to stat {file_path}: {exc}")
+                    errors.append({"path": path_str, "error": str(exc)})
+                    total_processed += 1
+                    log_progress()
+                    continue
 
-            if ignore_deleted and should_ignore_file(file_path, file_stat.st_size):
-                stats["excluded"] += 1
-                continue
+                if ignore_deleted and should_ignore_file(file_path, file_stat.st_size):
+                    stats["excluded"] += 1
+                    continue
 
-            # Compute hash first for hash-based matching
-            try:
-                digest = compute_hash(file_path)
-            except OSError as exc:
-                stats["errors"] += 1
-                logging.warning(f"Failed to hash {file_path}: {exc}")
-                errors.append({"path": path_str, "error": str(exc)})
-                continue
+                # Compute hash first for hash-based matching
+                try:
+                    digest = compute_hash(file_path)
+                except OSError as exc:
+                    stats["errors"] += 1
+                    logging.warning(f"Failed to hash {file_path}: {exc}")
+                    errors.append({"path": path_str, "error": str(exc)})
+                    total_processed += 1
+                    log_progress()
+                    continue
 
-            filename = file_path.name
-            # Try hash-based lookup first (handles moved/renamed files)
-            rows_by_hash = conn.execute(
-                "SELECT path, filename, hash_algo FROM files WHERE hash = ?",
-                (digest,),
-            ).fetchall()
+                filename = file_path.name
+                # Try hash-based lookup first (handles moved/renamed files)
+                rows_by_hash = conn.execute(
+                    "SELECT path, filename, hash_algo FROM files WHERE hash = ?",
+                    (digest,),
+                ).fetchall()
 
-            # Try path-based lookup for backwards compatibility
-            row_by_path = conn.execute(
-                "SELECT path, filename, hash, hash_algo FROM files WHERE path = ?",
-                (path_str,),
-            ).fetchone()
+                # Try path-based lookup for backwards compatibility
+                row_by_path = conn.execute(
+                    "SELECT path, filename, hash, hash_algo FROM files WHERE path = ?",
+                    (path_str,),
+                ).fetchone()
 
-            # Determine which row to use
-            row = None
-            matched_by_hash = False
-            if rows_by_hash:
-                # Found by hash - check if filename matches (prefer exact match)
-                for candidate in rows_by_hash:
-                    if candidate["filename"] == filename:
-                        row = candidate
+                # Determine which row to use
+                row = None
+                matched_by_hash = False
+                if rows_by_hash:
+                    # Found by hash - check if filename matches (prefer exact match)
+                    for candidate in rows_by_hash:
+                        if candidate["filename"] == filename:
+                            row = candidate
+                            matched_by_hash = True
+                            verified_hashes.add(digest)
+                            verified_paths.add(candidate["path"])
+                            break
+                    # If no filename match, use first hash match (file may have been renamed)
+                    if not row:
+                        row = rows_by_hash[0]
                         matched_by_hash = True
                         verified_hashes.add(digest)
-                        verified_paths.add(candidate["path"])
-                        break
-                # If no filename match, use first hash match (file may have been renamed)
+                        verified_paths.add(row["path"])
+                elif row_by_path:
+                    # Found by path (backwards compatibility)
+                    row = row_by_path
+                    verified_paths.add(path_str)
+                    # Check if hash matches
+                    if row_by_path["hash"] != digest:
+                        # Path matches but hash doesn't - file was modified
+                        stats["mismatched"] += 1
+                        mismatched.append(
+                            {
+                                "path": path_str,
+                                "size": file_stat.st_size,
+                                "mtime_ns": file_stat.st_mtime_ns,
+                                "expected_hash": row_by_path["hash"],
+                                "actual_hash": digest,
+                            }
+                        )
+                        total_processed += 1
+                        log_progress()
+                        continue
+
                 if not row:
-                    row = rows_by_hash[0]
-                    matched_by_hash = True
-                    verified_hashes.add(digest)
-                    verified_paths.add(row["path"])
-            elif row_by_path:
-                # Found by path (backwards compatibility)
-                row = row_by_path
-                verified_paths.add(path_str)
-                # Check if hash matches
-                if row_by_path["hash"] != digest:
-                    # Path matches but hash doesn't - file was modified
-                    stats["mismatched"] += 1
-                    mismatched.append(
+                    stats["untracked"] += 1
+                    untracked.append(
                         {
                             "path": path_str,
                             "size": file_stat.st_size,
                             "mtime_ns": file_stat.st_mtime_ns,
-                            "expected_hash": row_by_path["hash"],
-                            "actual_hash": digest,
                         }
                     )
+                    total_processed += 1
+                    log_progress()
                     continue
 
-            if not row:
-                stats["untracked"] += 1
-                untracked.append(
-                    {
-                        "path": path_str,
-                        "size": file_stat.st_size,
-                        "mtime_ns": file_stat.st_mtime_ns,
-                    }
-                )
-                continue
+                if row["hash_algo"] != DEFAULT_HASH_ALGO:
+                    stats["errors"] += 1
+                    logging.warning(
+                        f"Unsupported hash algorithm for {file_path}: {row['hash_algo']}"
+                    )
+                    errors.append(
+                        {
+                            "path": path_str,
+                            "error": f"Unsupported hash algorithm: {row['hash_algo']}",
+                        }
+                    )
+                    total_processed += 1
+                    log_progress()
+                    continue
 
-            if row["hash_algo"] != DEFAULT_HASH_ALGO:
-                stats["errors"] += 1
-                logging.warning(
-                    f"Unsupported hash algorithm for {file_path}: {row['hash_algo']}"
-                )
-                errors.append(
-                    {
-                        "path": path_str,
-                        "error": f"Unsupported hash algorithm: {row['hash_algo']}",
-                    }
-                )
-                continue
+                # Hash matches (already computed above)
+                stats["verified"] += 1
+                if matched_by_hash and row["path"] != path_str:
+                    # File was moved/renamed - log this for information
+                    logging.debug(f"File moved: {row['path']} -> {path_str}")
 
-            # Hash matches (already computed above)
-            stats["verified"] += 1
-            if matched_by_hash and row["path"] != path_str:
-                # File was moved/renamed - log this for information
-                logging.debug(f"File moved: {row['path']} -> {path_str}")
+                total_processed += 1
+                log_progress()
+        else:
+            # Multi-threaded path
+            logging.info(f"Using {workers} worker threads for hashing")
+            hash_batch: List[FileInfo] = []
+
+            def flush_batch() -> None:
+                nonlocal total_processed
+                if not hash_batch:
+                    return
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = [executor.submit(compute_hash_task, fi) for fi in hash_batch]
+                    for future in as_completed(futures):
+                        result = future.result()
+                        _process_hash_result_verify(
+                            result, conn, stats, mismatched, untracked, errors,
+                            verified_hashes, verified_paths
+                        )
+                        total_processed += 1
+                        log_progress()
+                hash_batch.clear()
+
+            for file_path in iter_files(root):
+                path_str = str(file_path)
+                if path_str in excluded_paths:
+                    stats["excluded"] += 1
+                    continue
+                if file_path.suffix.lower() in exclude_exts:
+                    stats["excluded"] += 1
+                    continue
+
+                stats["scanned"] += 1
+                try:
+                    file_stat = file_path.stat()
+                except OSError as exc:
+                    stats["errors"] += 1
+                    logging.warning(f"Failed to stat {file_path}: {exc}")
+                    errors.append({"path": path_str, "error": str(exc)})
+                    total_processed += 1
+                    log_progress()
+                    continue
+
+                if ignore_deleted and should_ignore_file(file_path, file_stat.st_size):
+                    stats["excluded"] += 1
+                    continue
+
+                # Queue for hashing
+                hash_batch.append(FileInfo(
+                    path=file_path,
+                    path_str=path_str,
+                    filename=file_path.name,
+                    size=file_stat.st_size,
+                    mtime_ns=file_stat.st_mtime_ns,
+                ))
+                if len(hash_batch) >= HASH_BATCH_SIZE:
+                    flush_batch()
+
+            # Flush remaining batch
+            flush_batch()
 
         # Check for missing files: entries in DB that weren't found
         def _db_row_ignored(row: object) -> bool:
@@ -525,6 +918,11 @@ def verify_files(
         conn.close()
 
     run_finished = int(time.time())
+    logging.info(
+        f"Completed: scanned={stats['scanned']}, verified={stats['verified']}, "
+        f"mismatched={stats['mismatched']}, missing={stats['missing']}, "
+        f"untracked={stats['untracked']}, errors={stats['errors']}"
+    )
     details: Dict[str, object] = {
         "mismatched": mismatched,
         "missing": missing,
@@ -535,6 +933,8 @@ def verify_files(
         details["cross_root"] = True
     if ignore_deleted:
         details["ignore_deleted"] = True
+    if workers > 1:
+        details["workers"] = workers
 
     report = build_report(
         root=root,
@@ -571,10 +971,12 @@ Examples:
     python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db
     python verify_integrity.py index --root /path/to/photos --ignore-deleted
     python verify_integrity.py index --root /path/to/photos --report my_report.json
+    python verify_integrity.py index --root /path/to/photos --workers 4
 
   verify:
     python verify_integrity.py verify --root /path/to/photos --db integrity.db
     python verify_integrity.py verify --root /path/to/backup --db integrity.db --cross-root
+    python verify_integrity.py verify --root /path/to/photos --workers 4
         """,
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -621,6 +1023,12 @@ Examples:
         '--verbose',
         action='store_true',
         help='Enable verbose (debug) logging',
+    )
+    index_parser.add_argument(
+        '--workers',
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f'Number of parallel hashing threads (default: {DEFAULT_WORKERS})',
     )
 
     verify_parser = subparsers.add_parser(
@@ -672,6 +1080,12 @@ Examples:
         action='store_true',
         help='Enable verbose (debug) logging',
     )
+    verify_parser.add_argument(
+        '--workers',
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f'Number of parallel hashing threads (default: {DEFAULT_WORKERS})',
+    )
 
     args = parser.parse_args()
 
@@ -693,6 +1107,7 @@ Examples:
             exclude_exts=exclude_exts,
             report_path=args.report,
             ignore_deleted=args.ignore_deleted,
+            workers=args.workers,
         )
         write_report(report, args.report)
         sys.exit(0)
@@ -715,6 +1130,7 @@ Examples:
                 report_path=args.report,
                 cross_root=args.cross_root,
                 ignore_deleted=args.ignore_deleted,
+                workers=args.workers,
             )
         except FileNotFoundError as exc:
             logging.error(str(exc))
