@@ -243,7 +243,7 @@ def _process_hash_results_index(
     updated: List[Dict[str, object]],
     errors: List[Dict[str, object]],
 ) -> int:
-    """Process hash results and write to database. Returns count of processed items."""
+    """Process hash results and write to database. Returns count of successes."""
     processed = 0
     for result in results:
         fi = result.file_info
@@ -426,7 +426,7 @@ def index_files(
                     results, conn, run_started, stats, added, updated, errors
                 )
                 processed_since_commit += processed
-                total_processed += processed
+                total_processed += len(results)
                 log_progress()
                 if processed_since_commit >= COMMIT_EVERY:
                     conn.commit()
