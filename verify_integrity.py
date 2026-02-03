@@ -180,6 +180,32 @@ def is_under_root(file_path: Path, root: Path) -> bool:
     return True
 
 
+def _upsert_file_record(
+    conn: sqlite3.Connection,
+    path_str: str,
+    filename: str,
+    size: int,
+    mtime_ns: int,
+    digest: str,
+    run_started: int,
+) -> None:
+    """Insert or update a file record in the files table."""
+    conn.execute(
+        """
+        INSERT INTO files (path, filename, size, mtime_ns, hash, hash_algo, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            filename = excluded.filename,
+            size = excluded.size,
+            mtime_ns = excluded.mtime_ns,
+            hash = excluded.hash,
+            hash_algo = excluded.hash_algo,
+            last_seen = excluded.last_seen
+        """,
+        (path_str, filename, size, mtime_ns, digest, DEFAULT_HASH_ALGO, run_started),
+    )
+
+
 def build_report(
     root: Path,
     db_path: Path,
@@ -250,20 +276,7 @@ def _process_hash_results_index(
                 }
             )
 
-        conn.execute(
-            """
-            INSERT INTO files (path, filename, size, mtime_ns, hash, hash_algo, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                filename = excluded.filename,
-                size = excluded.size,
-                mtime_ns = excluded.mtime_ns,
-                hash = excluded.hash,
-                hash_algo = excluded.hash_algo,
-                last_seen = excluded.last_seen
-            """,
-            (fi.path_str, fi.filename, fi.size, fi.mtime_ns, digest, DEFAULT_HASH_ALGO, run_started),
-        )
+        _upsert_file_record(conn, fi.path_str, fi.filename, fi.size, fi.mtime_ns, digest, run_started)
         processed += 1
     return processed
 
@@ -384,19 +397,8 @@ def index_files(
                             }
                         )
 
-                    conn.execute(
-                        """
-                        INSERT INTO files (path, filename, size, mtime_ns, hash, hash_algo, last_seen)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(path) DO UPDATE SET
-                            filename = excluded.filename,
-                            size = excluded.size,
-                            mtime_ns = excluded.mtime_ns,
-                            hash = excluded.hash,
-                            hash_algo = excluded.hash_algo,
-                            last_seen = excluded.last_seen
-                        """,
-                        (path_str, filename, size, mtime_ns, digest, DEFAULT_HASH_ALGO, run_started),
+                    _upsert_file_record(
+                        conn, path_str, filename, size, mtime_ns, digest, run_started
                     )
 
                 processed_since_commit += 1
