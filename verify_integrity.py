@@ -710,102 +710,24 @@ def verify_files(
                     stats["excluded"] += 1
                     continue
 
-                # Compute hash first for hash-based matching
-                try:
-                    digest = compute_hash(file_path)
-                except OSError as exc:
-                    stats["errors"] += 1
-                    logging.warning(f"Failed to hash {file_path}: {exc}")
-                    errors.append({"path": path_str, "error": str(exc)})
-                    total_processed += 1
-                    log_progress()
-                    continue
-
-                filename = file_path.name
-                # Try hash-based lookup first (handles moved/renamed files)
-                rows_by_hash = conn.execute(
-                    "SELECT path, filename, hash_algo FROM files WHERE hash = ?",
-                    (digest,),
-                ).fetchall()
-
-                # Try path-based lookup for backwards compatibility
-                row_by_path = conn.execute(
-                    "SELECT path, filename, hash, hash_algo FROM files WHERE path = ?",
-                    (path_str,),
-                ).fetchone()
-
-                # Determine which row to use
-                row = None
-                matched_by_hash = False
-                if rows_by_hash:
-                    # Found by hash - check if filename matches (prefer exact match)
-                    for candidate in rows_by_hash:
-                        if candidate["filename"] == filename:
-                            row = candidate
-                            matched_by_hash = True
-                            verified_hashes.add(digest)
-                            verified_paths.add(candidate["path"])
-                            break
-                    # If no filename match, use first hash match (file may have been renamed)
-                    if not row:
-                        row = rows_by_hash[0]
-                        matched_by_hash = True
-                        verified_hashes.add(digest)
-                        verified_paths.add(row["path"])
-                elif row_by_path:
-                    # Found by path (backwards compatibility)
-                    row = row_by_path
-                    verified_paths.add(path_str)
-                    # Check if hash matches
-                    if row_by_path["hash"] != digest:
-                        # Path matches but hash doesn't - file was modified
-                        stats["mismatched"] += 1
-                        mismatched.append(
-                            {
-                                "path": path_str,
-                                "size": file_stat.st_size,
-                                "mtime_ns": file_stat.st_mtime_ns,
-                                "expected_hash": row_by_path["hash"],
-                                "actual_hash": digest,
-                            }
-                        )
-                        total_processed += 1
-                        log_progress()
-                        continue
-
-                if not row:
-                    stats["untracked"] += 1
-                    untracked.append(
-                        {
-                            "path": path_str,
-                            "size": file_stat.st_size,
-                            "mtime_ns": file_stat.st_mtime_ns,
-                        }
-                    )
-                    total_processed += 1
-                    log_progress()
-                    continue
-
-                if row["hash_algo"] != DEFAULT_HASH_ALGO:
-                    stats["errors"] += 1
-                    logging.warning(
-                        f"Unsupported hash algorithm for {file_path}: {row['hash_algo']}"
-                    )
-                    errors.append(
-                        {
-                            "path": path_str,
-                            "error": f"Unsupported hash algorithm: {row['hash_algo']}",
-                        }
-                    )
-                    total_processed += 1
-                    log_progress()
-                    continue
-
-                # Hash matches (already computed above)
-                stats["verified"] += 1
-                if matched_by_hash and row["path"] != path_str:
-                    # File was moved/renamed - log this for information
-                    logging.debug(f"File moved: {row['path']} -> {path_str}")
+                file_info = FileInfo(
+                    path=file_path,
+                    path_str=path_str,
+                    filename=file_path.name,
+                    size=file_stat.st_size,
+                    mtime_ns=file_stat.st_mtime_ns,
+                )
+                result = compute_hash_task(file_info)
+                _process_hash_result_verify(
+                    result,
+                    conn,
+                    stats,
+                    mismatched,
+                    untracked,
+                    errors,
+                    verified_hashes,
+                    verified_paths,
+                )
 
                 total_processed += 1
                 log_progress()
