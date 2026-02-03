@@ -326,3 +326,161 @@ def test_ignore_deleted_prefix_and_size(tmp_path: Path):
     assert verify_report["stats"]["verified"] == 3
     assert verify_report["stats"]["excluded"] == 1
     assert verify_report["stats"]["missing"] == 0
+
+
+def test_index_files_multithreaded_produces_same_results(tmp_path: Path):
+    """Test that multi-threaded index produces same results as single-threaded."""
+    root = tmp_path / "root"
+    db_single = tmp_path / "single.db"
+    db_multi = tmp_path / "multi.db"
+    report_path = tmp_path / "report.json"
+
+    # Create several files of varying sizes
+    _write_file(root / "a.txt", b"alpha")
+    _write_file(root / "b.txt", b"beta" * 100)
+    _write_file(root / "c.txt", b"gamma" * 1000)
+    _write_file(root / "nested" / "d.txt", b"delta")
+    _write_file(root / "nested" / "deep" / "e.txt", b"epsilon" * 500)
+
+    # Index with single thread
+    report_single = index_files(
+        root=root,
+        db_path=db_single,
+        exclude_exts=set(),
+        report_path=report_path,
+        workers=1,
+    )
+
+    # Index with multiple threads
+    report_multi = index_files(
+        root=root,
+        db_path=db_multi,
+        exclude_exts=set(),
+        report_path=report_path,
+        workers=4,
+    )
+
+    # Stats should match
+    assert report_single["stats"]["scanned"] == report_multi["stats"]["scanned"]
+    assert report_single["stats"]["hashed_new"] == report_multi["stats"]["hashed_new"]
+    assert report_single["stats"]["errors"] == report_multi["stats"]["errors"]
+
+    # Report should indicate workers used
+    assert report_multi.get("workers") == 4
+    assert "workers" not in report_single  # Single-threaded doesn't add this
+
+    # Database contents should match
+    rows_single = _fetch_db_rows(db_single)
+    rows_multi = _fetch_db_rows(db_multi)
+
+    assert len(rows_single) == len(rows_multi)
+
+    # Build hash maps to compare (order may differ)
+    hash_map_single = {row["path"]: row["hash"] for row in rows_single}
+    hash_map_multi = {row["path"]: row["hash"] for row in rows_multi}
+
+    assert hash_map_single == hash_map_multi
+
+
+def test_verify_files_multithreaded_produces_same_results(tmp_path: Path):
+    """Test that multi-threaded verify produces same results as single-threaded."""
+    root = tmp_path / "root"
+    db_path = tmp_path / "integrity.db"
+    report_path = tmp_path / "report.json"
+
+    # Create files
+    _write_file(root / "a.txt", b"alpha")
+    _write_file(root / "b.txt", b"beta" * 100)
+    _write_file(root / "c.txt", b"gamma" * 1000)
+    _write_file(root / "nested" / "d.txt", b"delta")
+
+    # Index first
+    index_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+
+    # Modify one file and add an untracked file
+    _write_file(root / "a.txt", b"modified")
+    _write_file(root / "new.txt", b"untracked")
+
+    # Verify with single thread
+    report_single = verify_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+        workers=1,
+    )
+
+    # Verify with multiple threads
+    report_multi = verify_files(
+        root=root,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+        workers=4,
+    )
+
+    # Stats should match
+    assert report_single["stats"]["scanned"] == report_multi["stats"]["scanned"]
+    assert report_single["stats"]["verified"] == report_multi["stats"]["verified"]
+    assert report_single["stats"]["mismatched"] == report_multi["stats"]["mismatched"]
+    assert report_single["stats"]["untracked"] == report_multi["stats"]["untracked"]
+    assert report_single["stats"]["errors"] == report_multi["stats"]["errors"]
+
+    # Report should indicate workers used
+    assert report_multi.get("workers") == 4
+
+    # Mismatched files should be the same
+    mismatch_single = {item["path"] for item in report_single["mismatched"]}
+    mismatch_multi = {item["path"] for item in report_multi["mismatched"]}
+    assert mismatch_single == mismatch_multi
+
+    # Untracked files should be the same
+    untracked_single = {item["path"] for item in report_single["untracked"]}
+    untracked_multi = {item["path"] for item in report_multi["untracked"]}
+    assert untracked_single == untracked_multi
+
+
+def test_verify_files_multithreaded_cross_root(tmp_path: Path):
+    """Test that multi-threaded verify works correctly with --cross-root."""
+    source = tmp_path / "source"
+    backup = tmp_path / "backup"
+    db_path = tmp_path / "integrity.db"
+    report_path = tmp_path / "report.json"
+
+    # Create source files
+    _write_file(source / "a.txt", b"alpha")
+    _write_file(source / "b.txt", b"beta")
+    _write_file(source / "c.txt", b"gamma")
+
+    # Index source
+    index_files(
+        root=source,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+    )
+
+    # Create backup with different structure but same content
+    _write_file(backup / "folder1" / "a.txt", b"alpha")
+    _write_file(backup / "folder2" / "b.txt", b"beta")
+    # c.txt is missing from backup
+
+    # Verify with multiple threads
+    report = verify_files(
+        root=backup,
+        db_path=db_path,
+        exclude_exts=set(),
+        report_path=report_path,
+        cross_root=True,
+        workers=4,
+    )
+
+    assert report["stats"]["verified"] == 2
+    assert report["stats"]["missing"] == 1
+    assert report.get("workers") == 4
+    assert report.get("cross_root") is True
