@@ -293,6 +293,9 @@ def index_files(
     stats = {
         "scanned": 0,
         "excluded": 0,
+        "excluded_by_path": 0,
+        "excluded_by_extension": 0,
+        "excluded_ignore_deleted": 0,
         "hashed_new": 0,
         "hashed_updated": 0,
         "unchanged": 0,
@@ -312,6 +315,7 @@ def index_files(
     processed_since_commit = 0
     total_processed = 0
     last_progress_log = 0
+    db_entries_after = 0
 
     def log_progress() -> None:
         nonlocal last_progress_log
@@ -329,9 +333,11 @@ def index_files(
             for file_path in iter_files(root):
                 path_str = str(file_path)
                 if path_str in excluded_paths:
+                    stats["excluded_by_path"] += 1
                     stats["excluded"] += 1
                     continue
                 if file_path.suffix.lower() in exclude_exts:
+                    stats["excluded_by_extension"] += 1
                     stats["excluded"] += 1
                     continue
 
@@ -349,6 +355,7 @@ def index_files(
                 size = file_stat.st_size
                 mtime_ns = file_stat.st_mtime_ns
                 if ignore_deleted and should_ignore_file(file_path, size):
+                    stats["excluded_ignore_deleted"] += 1
                     stats["excluded"] += 1
                     continue
 
@@ -436,9 +443,11 @@ def index_files(
             for file_path in iter_files(root):
                 path_str = str(file_path)
                 if path_str in excluded_paths:
+                    stats["excluded_by_path"] += 1
                     stats["excluded"] += 1
                     continue
                 if file_path.suffix.lower() in exclude_exts:
+                    stats["excluded_by_extension"] += 1
                     stats["excluded"] += 1
                     continue
 
@@ -456,6 +465,7 @@ def index_files(
                 size = file_stat.st_size
                 mtime_ns = file_stat.st_mtime_ns
                 if ignore_deleted and should_ignore_file(file_path, size):
+                    stats["excluded_ignore_deleted"] += 1
                     stats["excluded"] += 1
                     continue
 
@@ -495,19 +505,46 @@ def index_files(
             flush_batch()
             if processed_since_commit:
                 conn.commit()
+        db_entries_after = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     finally:
         conn.close()
 
     run_finished = int(time.time())
+
+    summary: Dict[str, object] = {
+        "total_files_walked": stats["scanned"] + stats["excluded"],
+        "already_indexed_unchanged": stats["unchanged"],
+        "hashed_this_run": stats["hashed_new"] + stats["hashed_updated"],
+        "excluded_breakdown": {
+            "by_extension": stats["excluded_by_extension"],
+            "ignore_deleted": stats["excluded_ignore_deleted"],
+            "by_path": stats["excluded_by_path"],
+        },
+        "db_entries_after": db_entries_after,
+        "errors": stats["errors"],
+    }
+
     logging.info(
-        f"Completed: scanned={stats['scanned']}, "
-        f"hashed_new={stats['hashed_new']}, hashed_updated={stats['hashed_updated']}, "
-        f"unchanged={stats['unchanged']}, errors={stats['errors']}"
+        "Index summary: %d files walked | "
+        "already indexed (unchanged): %d | hashed this run: %d | "
+        "excluded (by ext: %d, ._* <4KB: %d, path: %d) | errors: %d | DB total: %d"
+        % (
+            summary["total_files_walked"],
+            summary["already_indexed_unchanged"],
+            summary["hashed_this_run"],
+            stats["excluded_by_extension"],
+            stats["excluded_ignore_deleted"],
+            stats["excluded_by_path"],
+            stats["errors"],
+            db_entries_after,
+        )
     )
+
     details: Dict[str, object] = {
         "added": added,
         "updated": updated,
         "errors": errors,
+        "summary": summary,
     }
     if ignore_deleted:
         details["ignore_deleted"] = True
