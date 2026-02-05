@@ -339,62 +339,6 @@ date, desc = parse_destination_folder_name("2022-09-10_CrescentPark-SurreyBC")
 
 ---
 
-## verify_integrity.py
-
-Scans a directory tree, computes SHA-256 hashes for new or changed files, and stores
-them in a local SQLite database. Two subcommands: **index** (build/update the DB) and
-**verify** (compare current hashes to stored ones). A JSON report is always written.
-
-### Features
-
-- **Incremental hashing**: Only new or changed files are hashed
-- **Integrity verification**: Re-hash files and compare against stored hashes
-- **SQLite storage**: Stores path, size, mtime, hash, and last_seen
-- **Exclude file types**: Skip file extensions you do not want to track
-- **JSON report**: Summary and details (added/updated or mismatched/missing/untracked) written to a report file
-
-### Index options
-
-| Option | Description |
-|--------|-------------|
-| `--root` | **(required)** Root directory to scan recursively |
-| `--db` | Path to SQLite database (default: `integrity.db`) |
-| `--report` | Path to JSON report file (default: `report.json`) |
-| `--exclude-ext` | File extensions to exclude, comma-separated or repeatable (e.g. `.tmp`, `.db`) |
-| `--ignore-deleted` | Ignore `._*` files &lt; 4KB (matches delete_by_filename criteria) |
-| `--log` | Write log output to this file |
-| `--verbose` | Enable verbose (debug) logging |
-
-### Usage
-
-```bash
-# Index files (report written to report.json by default)
-python verify_integrity.py index --root /path/to/photos --db integrity.db
-
-# Custom report path
-python verify_integrity.py index --root /path/to/photos --report /path/to/index_report.json
-
-# Exclude file types by extension
-python verify_integrity.py index --root /path/to/photos --exclude-ext .tmp,.db
-
-# Ignore ._* files < 4KB (delete_by_filename-style)
-python verify_integrity.py index --root /path/to/photos --ignore-deleted
-
-# Verify files against stored hashes (report to verify.json by default)
-python verify_integrity.py verify --root /path/to/photos --db integrity.db
-
-# Verify a backup tree (--cross-root): DB from source, root = backup
-python verify_integrity.py verify --root /path/to/backup --db integrity.db --cross-root
-```
-
-### Notes
-
-- The script does not follow symlinks.
-- A JSON report is always written (default paths: `report.json` for index, `verify.json` for verify). Use `--report` to change the path.
-- Verification re-hashes all relevant files; expect it to take time on large collections.
-
----
-
 ## Testing
 
 All scripts include comprehensive test suites. Run tests with:
@@ -409,6 +353,5 @@ Or run tests for a specific script:
 pytest test_organize_by_date.py -v
 pytest test_rename_folders.py -v
 pytest test_delete_by_filename.py -v
-pytest test_verify_integrity.py -v
 pytest test_verify_backup.py -v
 ```
