@@ -90,7 +90,9 @@ def test_load_preset_names(temp_dirs):
 
 def test_convert_videos_dry_run(temp_dirs):
     source_dir, dest_dir = temp_dirs
-    preset_path = source_dir / "presets.json"
+    # Preset lives outside source_dir so it isn't counted in "scanned" (we only
+    # scan source content: clip1.mov, clip2.mp4, notes.txt = 3 files).
+    preset_path = dest_dir / "presets.json"
     create_preset_file(preset_path)
 
     create_test_file(source_dir / "clip1.mov")
