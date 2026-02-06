@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -77,6 +78,21 @@ def test_get_preferred_timestamp_filesystem(temp_dirs):
     timestamp, source = get_preferred_timestamp(file_path)
     assert source == "filesystem"
     assert abs((timestamp - test_date).total_seconds()) < 5
+
+
+def test_get_preferred_timestamp_old_file_recent_metadata_fallback(temp_dirs):
+    """When metadata says 'today' but file on disk is old (e.g. MOD), use filesystem date."""
+    source_dir, _ = temp_dirs
+    old_date = datetime(2009, 6, 10, 14, 0, 0)
+    file_path = source_dir / "camcorder.mod"
+    create_test_file(file_path, "fake mod data", old_date)
+
+    with patch("convert_videos.get_video_metadata_date") as mock_meta:
+        mock_meta.return_value = datetime.now()  # metadata says "now"
+        timestamp, source = get_preferred_timestamp(file_path)
+    # Should prefer filesystem (2009) over recent metadata
+    assert source == "filesystem"
+    assert abs((timestamp - old_date).total_seconds()) < 5
 
 
 def test_load_preset_names(temp_dirs):

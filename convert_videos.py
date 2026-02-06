@@ -190,22 +190,95 @@ def get_filesystem_creation_time(file_path: Path) -> datetime:
 
 def get_preferred_timestamp(file_path: Path) -> Tuple[datetime, str]:
     """Return the best available timestamp and its source."""
+    fs_time = get_filesystem_creation_time(file_path)
+    now = datetime.now()
+    # If metadata says "recent" but the file on disk is old, prefer filesystem
+    # (e.g. MOD/MPEG often have no real creation date and mutagen may return today).
+    def _is_recent(d: datetime, within_days: float = 2.0) -> bool:
+        return (now - d).total_seconds() >= 0 and (now - d).total_seconds() < within_days * 86400
+
+    def _is_old(d: datetime, older_than_days: float = 7.0) -> bool:
+        return (now - d).total_seconds() > older_than_days * 86400
+
     metadata_date = get_video_metadata_date(file_path)
     if metadata_date:
+        if _is_recent(metadata_date) and _is_old(fs_time):
+            logging.debug(
+                f"Ignoring recent metadata date {metadata_date} for old file; using filesystem {fs_time}"
+            )
+            return fs_time, 'filesystem'
         return metadata_date, 'metadata'
 
     if file_path.suffix.lower() in IMAGE_EXTENSIONS:
         exif_date = get_exif_date(file_path)
         if exif_date:
+            if _is_recent(exif_date) and _is_old(fs_time):
+                logging.debug(
+                    f"Ignoring recent EXIF date {exif_date} for old file; using filesystem {fs_time}"
+                )
+                return fs_time, 'filesystem'
             return exif_date, 'exif'
 
-    return get_filesystem_creation_time(file_path), 'filesystem'
+    return fs_time, 'filesystem'
+
+
+def _set_creation_time_windows(file_path: Path, timestamp: datetime) -> None:
+    """Set file creation time on Windows (so 'Date created' is preserved)."""
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        HANDLE = wintypes.HANDLE
+        LPFILETIME = ctypes.POINTER(wintypes.FILETIME)
+
+        # 100-nanosecond intervals between 1601-01-01 and 1970-01-01
+        EPOCH_OFFSET = 116444736000000000
+        epoch_ns = int(timestamp.timestamp() * 1_000_000)
+        ft_value = epoch_ns * 10 + EPOCH_OFFSET
+        ft_low = ft_value & 0xFFFFFFFF
+        ft_high = (ft_value >> 32) & 0xFFFFFFFF
+
+        creation_ft = wintypes.FILETIME(ft_low, ft_high)
+        access_ft = creation_ft
+        write_ft = creation_ft
+
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        OPEN_EXISTING = 3
+        FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+
+        handle = kernel32.CreateFileW(
+            str(file_path.resolve()),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        if handle == HANDLE(-1).value:
+            return
+        try:
+            kernel32.SetFileTime(
+                handle,
+                ctypes.byref(creation_ft),
+                ctypes.byref(access_ft),
+                ctypes.byref(write_ft),
+            )
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as exc:
+        logging.debug(f"Could not set Windows creation time for {file_path}: {exc}")
 
 
 def apply_timestamps(target_path: Path, timestamp: datetime) -> None:
-    """Apply the timestamp to the output file (mtime/atime)."""
+    """Apply the timestamp to the output file (mtime/atime, and creation time on Windows)."""
     epoch = timestamp.timestamp()
     os.utime(target_path, (epoch, epoch))
+    _set_creation_time_windows(target_path, timestamp)
 
 
 def find_preset_names(data) -> List[str]:
