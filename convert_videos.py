@@ -153,11 +153,13 @@ def parse_video_datetime(date_str: str) -> Optional[datetime]:
 def get_video_metadata_date(video_path: Path) -> Optional[datetime]:
     """Extract creation date from video file metadata using mutagen."""
     if not MUTAGEN_AVAILABLE:
+        logging.debug(f"  metadata: (mutagen not available)")
         return None
 
     try:
         metadata = MutagenFile(str(video_path))
         if not metadata:
+            logging.debug(f"  metadata: no tags from mutagen for {video_path.name}")
             return None
 
         dates = []
@@ -168,29 +170,42 @@ def get_video_metadata_date(video_path: Path) -> Optional[datetime]:
                 parsed = parse_video_datetime(str(value))
                 if parsed:
                     dates.append(parsed)
+                    logging.debug(f"  metadata: tag {tag!r} = {value!r} -> {parsed}")
 
-        return min(dates) if dates else None
+        result = min(dates) if dates else None
+        if result is None:
+            logging.debug(f"  metadata: no parseable date in {list(metadata.keys())}")
+        return result
     except Exception as exc:
-        logging.debug(f"Failed to extract metadata from {video_path}: {exc}")
+        logging.debug(f"  metadata: failed for {video_path.name}: {exc}")
         return None
 
 
 def get_filesystem_creation_time(file_path: Path) -> datetime:
-    """Get best-effort filesystem creation time for a file."""
+    """Get best-effort date from the file (for display/sorting). Uses mtime on Windows
+    so that copied/backup files (where creation=today, modified=original date) keep
+    the meaningful date."""
     stat = file_path.stat()
     if hasattr(stat, 'st_birthtime'):
-        return datetime.fromtimestamp(stat.st_birthtime)
-
-    if os.name == 'nt':
-        return datetime.fromtimestamp(stat.st_ctime)
-
-    # On Unix, st_ctime is metadata change time; fall back to mtime.
-    return datetime.fromtimestamp(stat.st_mtime)
+        t = stat.st_birthtime
+        source = 'birthtime'
+    elif os.name == 'nt':
+        # Use mtime so backup files (created=today, modified=2009) give 2009.
+        t = stat.st_mtime
+        source = 'mtime'
+    else:
+        t = stat.st_mtime
+        source = 'mtime'
+    result = datetime.fromtimestamp(t)
+    logging.debug(f"  filesystem: {source} -> {result}")
+    return result
 
 
 def get_preferred_timestamp(file_path: Path) -> Tuple[datetime, str]:
     """Return the best available timestamp and its source."""
+    logging.info(f"Timestamp for {file_path.name}:")
     fs_time = get_filesystem_creation_time(file_path)
+    logging.info(f"  from filesystem: {fs_time}")
     now = datetime.now()
     # If metadata says "recent" but the file on disk is old, prefer filesystem
     # (e.g. MOD/MPEG often have no real creation date and mutagen may return today).
@@ -201,24 +216,31 @@ def get_preferred_timestamp(file_path: Path) -> Tuple[datetime, str]:
         return (now - d).total_seconds() > older_than_days * 86400
 
     metadata_date = get_video_metadata_date(file_path)
+    if metadata_date is not None:
+        logging.info(f"  from metadata: {metadata_date}")
+    else:
+        logging.info(f"  from metadata: (none)")
     if metadata_date:
         if _is_recent(metadata_date) and _is_old(fs_time):
-            logging.debug(
-                f"Ignoring recent metadata date {metadata_date} for old file; using filesystem {fs_time}"
+            logging.info(
+                f"  -> Ignoring recent metadata; using filesystem: {fs_time}"
             )
             return fs_time, 'filesystem'
+        logging.info(f"  -> Using metadata: {metadata_date}")
         return metadata_date, 'metadata'
 
     if file_path.suffix.lower() in IMAGE_EXTENSIONS:
         exif_date = get_exif_date(file_path)
         if exif_date:
             if _is_recent(exif_date) and _is_old(fs_time):
-                logging.debug(
-                    f"Ignoring recent EXIF date {exif_date} for old file; using filesystem {fs_time}"
+                logging.info(
+                    f"  -> Ignoring recent EXIF; using filesystem: {fs_time}"
                 )
                 return fs_time, 'filesystem'
+            logging.info(f"  -> Using exif: {exif_date}")
             return exif_date, 'exif'
 
+    logging.info(f"  -> Using filesystem: {fs_time}")
     return fs_time, 'filesystem'
 
 
@@ -277,8 +299,16 @@ def _set_creation_time_windows(file_path: Path, timestamp: datetime) -> None:
 def apply_timestamps(target_path: Path, timestamp: datetime) -> None:
     """Apply the timestamp to the output file (mtime/atime, and creation time on Windows)."""
     epoch = timestamp.timestamp()
+    logging.info(f"Setting timestamps on {target_path.name}: {timestamp} (epoch {epoch})")
     os.utime(target_path, (epoch, epoch))
     _set_creation_time_windows(target_path, timestamp)
+    # Log what the file has after (so we can confirm it took effect)
+    try:
+        st = target_path.stat()
+        mtime_after = datetime.fromtimestamp(st.st_mtime)
+        logging.info(f"  -> Verified {target_path.name}: mtime now {mtime_after}")
+    except OSError as e:
+        logging.warning(f"  -> Could not verify mtime for {target_path.name}: {e}")
 
 
 def find_preset_names(data) -> List[str]:
