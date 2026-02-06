@@ -6,15 +6,20 @@ Built with AI using Cursor.
 
 This collection of utilities helps organize and manage photo and movie files.
 
-It was created in response to me having a hard drive with 4 TB of photos and videos on a 2012 iMac in the Photos app.  I wanted to move the collection to a modern non-Apple machine and have full control over the data.  Exporting from Photos resulted in folder names that were poorly named and included proprietaru mac metadata that needed cleaning.  
+Folder/Photo Organizing Scripts:
 
-The scripts were used to move the data from Photos to a windows drive.
+- **organize_by_date.py**: Organize files into dated folders based on EXIF/metadata.  This script is useful after copying photos and movies out of an iPhone.   The resulting files are not sorted into sub-folders.  This script puts them in dated sub-folders.
 
-- **rename_folders.py**: Rename folders exported from Apple's Photos Mac app to standardized YYYY-MM-DD format.   This script can be used after files were exported from the Photos app.  
+Video Conversion Scripts:
 
 - **convert_videos.py**: Convert video files with HandBrakeCLI while preserving timestamps.
 
-- **organize_by_date.py**: Organize files into dated folders based on EXIF/metadata.  This script is useful after copying photos and movies out of an iPhone.   The resulting files are not sorted into sub-folders.  This script puts them in dated sub-folders.
+
+The following scripts were used to rename and tidy the files exported from Mac's 2012 Photos:
+
+They were created in response to having 4 TB of photos and videos on a 2012 iMac in the Mac Photos app.  The goal was to move the collection to a PC and have the data on the files system as individual files.  Exporting from Mac Photos resulted in folders  that were poorly named and included proprietary Mac metadata that needed cleaning.  
+
+- **rename_folders.py**: Rename folders exported from Apple's Photos Mac app to standardized YYYY-MM-DD format.   This script can be used after files were exported from the Photos app.  
 
 - **delete_by_filename.py**: Clean up mac metadata files (e.g., macOS `._` files).  I don't want these.  Someone might if they intend to rehydrate the files into a Mac OS.  
 

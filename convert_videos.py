@@ -2,9 +2,9 @@
 """
 Convert a folder of video files to a new format using HandBrakeCLI.
 
-This script filters files by extension, converts matching videos using a
-HandBrake preset file, and preserves timestamps based on metadata (when
-available) or filesystem creation time.
+This script filters files by extension, converts matching videos using
+HandBrakeCLI (optionally with a HandBrake preset file), and preserves
+timestamps based on metadata (when available) or filesystem creation time.
 """
 
 import argparse
@@ -267,7 +267,7 @@ def build_handbrake_command(
     handbrake_cli: str,
     input_path: Path,
     output_path: Path,
-    preset_name: str,
+    preset_name: Optional[str],
     preset_file: Optional[Path],
     handbrake_format: Optional[str],
     extra_args: Sequence[str],
@@ -299,8 +299,8 @@ def convert_videos(
     destination_dir: Path,
     extensions: Sequence[str],
     output_extension: str,
-    preset_file: Path,
-    preset_name: str,
+    preset_file: Optional[Path],
+    preset_name: Optional[str],
     handbrake_cli: str,
     handbrake_format: Optional[str],
     extra_args: Sequence[str],
@@ -405,13 +405,14 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Using a HandBrake preset file:
   python convert_videos.py --source /path/to/videos --destination /path/to/output \\
     --extensions mp4 mov --output-extension mp4 \\
     --handbrake-config /path/to/presets.json --preset-name "My Preset"
 
+  # Without a preset (use --format and/or --handbrake-args for encoding):
   python convert_videos.py --source /path/to/videos --destination /path/to/output \\
-    --extensions mp4,mov --output-extension mkv \\
-    --handbrake-config /path/to/presets.json --preset-name "My Preset" --recursive
+    --extensions mp4,mov --output-extension mkv --format av_mkv --recursive
         """
     )
 
@@ -441,12 +442,13 @@ Examples:
     parser.add_argument(
         '--handbrake-config',
         type=Path,
-        required=True,
-        help='Path to HandBrake preset JSON file'
+        default=None,
+        metavar='PATH',
+        help='Path to HandBrake preset JSON file (optional; use --handbrake-args and/or --format if omitted)'
     )
     parser.add_argument(
         '--preset-name',
-        help='Preset name to use. If omitted, the first preset in the config file is used.'
+        help='Preset name to use when --handbrake-config is set. If omitted, the first preset in the config is used.'
     )
     parser.add_argument(
         '--handbrake-cli',
@@ -500,12 +502,13 @@ Examples:
         logging.error(f"Source path is not a directory: {args.source}")
         sys.exit(1)
 
-    if not args.handbrake_config.exists():
-        logging.error(f"HandBrake config file does not exist: {args.handbrake_config}")
-        sys.exit(1)
-    if not args.handbrake_config.is_file():
-        logging.error(f"HandBrake config path is not a file: {args.handbrake_config}")
-        sys.exit(1)
+    if args.handbrake_config is not None:
+        if not args.handbrake_config.exists():
+            logging.error(f"HandBrake config file does not exist: {args.handbrake_config}")
+            sys.exit(1)
+        if not args.handbrake_config.is_file():
+            logging.error(f"HandBrake config path is not a file: {args.handbrake_config}")
+            sys.exit(1)
 
     extensions = normalize_extensions(args.extensions)
     if not extensions:
@@ -514,19 +517,21 @@ Examples:
 
     output_extension = normalize_extension(args.output_extension)
 
-    try:
-        preset_names = load_preset_names(args.handbrake_config)
-    except ValueError as exc:
-        logging.error(str(exc))
-        sys.exit(1)
-
-    preset_name = args.preset_name or preset_names[0]
-    if args.preset_name and args.preset_name not in preset_names:
-        logging.error(
-            f"Preset '{args.preset_name}' not found in config file. "
-            f"Available presets: {', '.join(preset_names)}"
-        )
-        sys.exit(1)
+    preset_file: Optional[Path] = args.handbrake_config
+    preset_name: Optional[str] = None
+    if args.handbrake_config is not None:
+        try:
+            preset_names = load_preset_names(args.handbrake_config)
+        except ValueError as exc:
+            logging.error(str(exc))
+            sys.exit(1)
+        preset_name = args.preset_name or preset_names[0]
+        if args.preset_name and args.preset_name not in preset_names:
+            logging.error(
+                f"Preset '{args.preset_name}' not found in config file. "
+                f"Available presets: {', '.join(preset_names)}"
+            )
+            sys.exit(1)
 
     extra_args = shlex.split(args.handbrake_args) if args.handbrake_args else []
 
@@ -545,7 +550,7 @@ Examples:
         destination_dir=args.destination,
         extensions=extensions,
         output_extension=output_extension,
-        preset_file=args.handbrake_config,
+        preset_file=preset_file,
         preset_name=preset_name,
         handbrake_cli=args.handbrake_cli,
         handbrake_format=args.handbrake_format,
