@@ -182,17 +182,19 @@ def get_video_metadata_date(video_path: Path) -> Optional[datetime]:
 
 
 def get_filesystem_creation_time(file_path: Path) -> datetime:
-    """Get best-effort date from the file (for display/sorting). Uses mtime on Windows
-    so that copied/backup files (where creation=today, modified=original date) keep
-    the meaningful date."""
+    """Get best-effort date from the file (for display/sorting).
+
+    On Windows, always use mtime so that copied/backup files (where
+    creation=today, modified=original date) keep the meaningful date.
+    """
     stat = file_path.stat()
-    if hasattr(stat, 'st_birthtime'):
-        t = stat.st_birthtime
-        source = 'birthtime'
-    elif os.name == 'nt':
+    if os.name == 'nt':
         # Use mtime so backup files (created=today, modified=2009) give 2009.
         t = stat.st_mtime
         source = 'mtime'
+    elif hasattr(stat, 'st_birthtime'):
+        t = stat.st_birthtime
+        source = 'birthtime'
     else:
         t = stat.st_mtime
         source = 'mtime'

@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from convert_videos import (
     build_output_path,
     convert_videos,
+    get_filesystem_creation_time,
     get_preferred_timestamp,
     load_preset_names,
     normalize_extensions,
@@ -93,6 +95,22 @@ def test_get_preferred_timestamp_old_file_recent_metadata_fallback(temp_dirs):
     # Should prefer filesystem (2009) over recent metadata
     assert source == "filesystem"
     assert abs((timestamp - old_date).total_seconds()) < 5
+
+
+def test_get_filesystem_creation_time_windows_prefers_mtime():
+    file_path = Path("dummy.mod")
+    mtime_epoch = 1_234_567_890
+    birthtime_epoch = 1_987_654_321
+    expected = datetime.fromtimestamp(mtime_epoch)
+
+    with patch("convert_videos.os.name", "nt"), patch("convert_videos.Path.stat") as mock_stat:
+        mock_stat.return_value = SimpleNamespace(
+            st_mtime=mtime_epoch,
+            st_birthtime=birthtime_epoch,
+        )
+        result = get_filesystem_creation_time(file_path)
+
+    assert result == expected
 
 
 def test_load_preset_names(temp_dirs):
