@@ -12,6 +12,8 @@ The scripts were used to move the data from Photos to a windows drive.
 
 - **rename_folders.py**: Rename folders exported from Apple's Photos Mac app to standardized YYYY-MM-DD format.   This script can be used after files were exported from the Photos app.  
 
+- **convert_videos.py**: Convert video files with HandBrakeCLI while preserving timestamps.
+
 - **organize_by_date.py**: Organize files into dated folders based on EXIF/metadata.  This script is useful after copying photos and movies out of an iPhone.   The resulting files are not sorted into sub-folders.  This script puts them in dated sub-folders.
 
 - **delete_by_filename.py**: Clean up mac metadata files (e.g., macOS `._` files).  I don't want these.  Someone might if they intend to rehydrate the files into a Mac OS.  
@@ -30,6 +32,62 @@ pip install -r requirements.txt
 - Pillow (for EXIF extraction)
 - mutagen (for video metadata)
 - pytest (for running tests)
+
+---
+
+## convert_videos.py
+
+Convert a folder of video files to a new format using HandBrakeCLI, while preserving
+timestamps based on metadata (when available) or filesystem creation times.
+
+### Requirements
+
+- HandBrakeCLI installed and available on PATH (or pass `--handbrake-cli`)
+- A HandBrake preset JSON file (`--handbrake-config`)
+
+### Features
+
+- **Extension filtering**: Only converts files matching the provided extensions
+- **HandBrake preset support**: Uses a preset file and preset name for consistent settings
+- **Timestamp preservation**: Sets output mtime/atime based on metadata or filesystem time
+- **Dry-run mode**: Preview conversions without running HandBrake
+- **Recursive mode**: Optional recursive scanning of subdirectories
+
+### Usage
+
+```bash
+# Convert MP4/MOV files to MP4 using a preset
+python convert_videos.py --source /path/to/videos --destination /path/to/output \
+  --extensions mp4 mov --output-extension mp4 \
+  --handbrake-config /path/to/presets.json --preset-name "My Preset"
+
+# Recursive conversion with comma-separated extensions
+python convert_videos.py --source /path/to/videos --destination /path/to/output \
+  --extensions mp4,mov --output-extension mkv \
+  --handbrake-config /path/to/presets.json --preset-name "My Preset" --recursive
+```
+
+### Command Line Options
+
+- `--source`: Source directory containing video files (required)
+- `--destination`: Destination directory for converted videos (required)
+- `--extensions`: File extensions to convert (required, supports `mp4 mov` or `mp4,mov`)
+- `--output-extension`: Output file extension (required)
+- `--handbrake-config`: Path to HandBrake preset JSON file (required)
+- `--preset-name`: Preset name to use (optional; defaults to first preset in config)
+- `--handbrake-cli`: Path to HandBrakeCLI binary (optional)
+- `--format`: HandBrake output format (optional, e.g. `av_mp4`)
+- `--handbrake-args`: Additional HandBrakeCLI arguments (optional)
+- `--recursive`: Recursively scan subdirectories
+- `--overwrite`: Overwrite existing output files
+- `--dry-run`: Preview conversions without running HandBrakeCLI
+- `--log`: Path to log file (optional)
+- `--verbose`: Enable verbose logging
+
+### Notes
+
+- Output timestamps are applied to modification/access times. Some filesystems
+  do not allow setting true creation time.
 
 ---
 
