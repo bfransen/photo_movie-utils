@@ -14,6 +14,9 @@ Video Conversion Scripts:
 
 - **convert_videos.py**: Convert video files with HandBrakeCLI while preserving timestamps.
 
+File timestamp utilities:
+
+- **copy_mtime_to_ctime.py**: Copy each file's modification time to its creation time (filesystem: Windows/macOS; MP4 metadata: requires ffmpeg).
 
 The following scripts were used to rename and tidy the files exported from Mac's 2012 Photos:
 
@@ -33,10 +36,32 @@ pip install -r requirements.txt
 
 ### Requirements
 
+**Python packages** (pip install -r requirements.txt):
+
 - Python 3.7+
-- Pillow (for EXIF extraction)
-- mutagen (for video metadata)
+- Pillow (for EXIF extraction in images)
+- mutagen (for video metadata read/write)
 - pytest (for running tests)
+
+**External binaries** (system install, not pip):
+
+- **HandBrakeCLI**: Required by `convert_videos.py`. Install HandBrake and ensure `HandBrakeCLI` is on PATH.
+- **ffmpeg**: Optional. Used to set `creation_time` in MP4 container metadata by `convert_videos.py` (MP4 output) and `copy_mtime_to_ctime.py` (MP4/M4V files). If missing, scripts skip the MP4 metadata step but still apply filesystem timestamps.
+- **SetFile** (macOS): Optional. Used by `copy_mtime_to_ctime.py` to set filesystem creation time on macOS. Install Xcode command-line tools: `xcode-select --install`.
+
+### How timestamps are set
+
+Scripts that write timestamps apply them at two levels:
+
+| Level | What is set | Platform / requirement |
+|-------|-------------|------------------------|
+| **Filesystem** | Modification time (mtime), access time (atime) | All platforms via `os.utime` |
+| **Filesystem** | Creation time (birth time) | Windows: Win32 API. macOS: `SetFile` (Xcode). Linux: not settable. |
+| **MP4 metadata** | `creation_time` in container | `.mp4` / `.m4v` files only; requires ffmpeg on PATH |
+
+**convert_videos.py**: After conversion, sets mtime/atime and (on Windows) creation time on the output file. For MP4/M4V output, also sets `creation_time` in the container if ffmpeg is available.
+
+**copy_mtime_to_ctime.py**: Copies each file's mtime to its creation time (filesystem) and, for MP4/M4V, to the container `creation_time` (via ffmpeg).
 
 ---
 
@@ -54,7 +79,7 @@ timestamps based on metadata (when available) or filesystem creation times.
 
 - **Extension filtering**: Only converts files matching the provided extensions
 - **HandBrake preset support**: Uses a preset file and preset name for consistent settings
-- **Timestamp preservation**: Sets output mtime/atime based on metadata or filesystem time
+- **Timestamp preservation**: Sets output mtime/atime based on metadata or filesystem time; for MP4 output, also sets `creation_time` in container metadata (requires ffmpeg)
 - **Dry-run mode**: Preview conversions without running HandBrake
 - **Recursive mode**: Optional recursive scanning of subdirectories
 
@@ -93,6 +118,54 @@ python convert_videos.py --source /path/to/videos --destination /path/to/output 
 
 - Output timestamps are applied to modification/access times. Some filesystems
   do not allow setting true creation time.
+- For MP4/M4V output, the script also sets `creation_time` in the container metadata
+  (requires ffmpeg on PATH). If ffmpeg is not available, filesystem timestamps are
+  still applied but metadata creation_time is skipped.
+
+---
+
+## copy_mtime_to_ctime.py
+
+Set each file's creation time to match its modification time. Useful when files
+are created with a wrong creation date (e.g. after copy/export) and you want
+creation time to match modification time.
+
+### Platform support
+
+- **Windows**: Sets creation time via Win32 API (no extra install).
+- **macOS**: Sets creation time via `SetFile` (requires Xcode: `xcode-select --install`).
+- **Linux**: Creation (birth) time is not settable by the kernel; the script reports and skips.
+
+### MP4 video metadata
+
+For `.mp4` and `.m4v` files, the script also sets `creation_time` in the container metadata.
+This requires **ffmpeg** to be installed and on PATH. If ffmpeg is not available, the script
+still updates filesystem creation time (on Windows/macOS) but skips the metadata step.
+
+### Usage
+
+```bash
+# Single file
+python copy_mtime_to_ctime.py /path/to/file.jpg
+
+# All files in a directory (recursive by default)
+python copy_mtime_to_ctime.py /path/to/folder
+
+# Only direct children (no subdirs)
+python copy_mtime_to_ctime.py /path/to/folder --no-recursive
+
+# Preview only
+python copy_mtime_to_ctime.py /path/to/folder --dry-run
+```
+
+### Command Line Options
+
+- `path`: File or directory to process (required)
+- `--recursive`, `-r`: If path is a directory, process all files under it (default)
+- `--no-recursive`: If path is a directory, process only direct children
+- `--dry-run`: Only report what would be done
+- `--log`: Path to log file (optional)
+- `--verbose`, `-v`: Verbose logging
 
 ---
 

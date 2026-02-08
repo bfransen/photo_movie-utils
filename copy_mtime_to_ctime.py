@@ -6,10 +6,8 @@ Useful when files are created with a wrong creation date (e.g. after copy/export
 and you want creation time to match modification time. Supports single files or
 recursive directory scanning.
 
-Platform support:
-- Windows: Sets creation time via Win32 API.
-- macOS: Sets creation time via SetFile (requires Xcode: xcode-select --install).
-- Linux: Creation (birth) time is not settable by the kernel; script reports and skips.
+- Filesystem: Sets creation time (Windows/macOS only; Linux cannot set birth time).
+- MP4 videos: Sets creation_time in the container metadata (requires ffmpeg).
 """
 
 import argparse
@@ -19,6 +17,11 @@ import platform
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from mp4_metadata import set_mp4_creation_time
+
+# Extensions for which we try to update container creation_time metadata
+_MP4_EXTENSIONS = frozenset({".mp4", ".m4v"})
 
 # Windows FILETIME: 100-nanosecond intervals since 1601-01-01 UTC
 _WIN_EPOCH_OFFSET = 11644473600  # seconds from 1601 to 1970
@@ -107,6 +110,19 @@ def _set_creation_time_macos(path: Path, mtime: float) -> bool:
         return False
 
 
+def _set_mp4_creation_time_metadata(path: Path, mtime: float) -> bool:
+    """Set creation_time in MP4 container metadata using ffmpeg (in-place)."""
+    if not set_mp4_creation_time(path, mtime):
+        logging.debug("MP4 metadata update skipped (ffmpeg not found or failed)")
+        return False
+    return True
+
+
+def _is_mp4_video(path: Path) -> bool:
+    """Return True if path looks like an MP4 video file."""
+    return path.suffix.lower() in _MP4_EXTENSIONS
+
+
 def set_creation_time_from_mtime(path: Path, mtime: Optional[float] = None) -> bool:
     """
     Set the file's creation time to its modification time.
@@ -193,18 +209,30 @@ def copy_mtime_to_ctime(
 
         if dry_run:
             logging.info(f"[DRY RUN] Would set creation time of {f} to mtime {mtime}")
+            if _is_mp4_video(f):
+                logging.info(f"[DRY RUN] Would set MP4 creation_time metadata: {f}")
             updated += 1
             continue
 
-        if set_creation_time_from_mtime(f, mtime):
-            logging.info(f"Set creation time: {f}")
+        fs_ok = set_creation_time_from_mtime(f, mtime)
+        meta_ok = False
+        if _is_mp4_video(f):
+            meta_ok = _set_mp4_creation_time_metadata(f, mtime)
+            if meta_ok:
+                logging.info(f"Set MP4 creation_time metadata: {f}")
+
+        if fs_ok or meta_ok:
+            if fs_ok:
+                logging.info(f"Set creation time: {f}")
             updated += 1
         else:
             skipped += 1
-            if system not in ("Windows", "Darwin"):
-                pass  # already logged platform warning
-            else:
+            if system not in ("Windows", "Darwin") and not _is_mp4_video(f):
+                pass  # already logged platform warning for fs; MP4 may have no ffmpeg
+            elif system in ("Windows", "Darwin") and not _is_mp4_video(f):
                 logging.warning(f"Could not set creation time: {f}")
+            elif _is_mp4_video(f) and not fs_ok and not meta_ok:
+                logging.warning(f"Could not set creation time or MP4 metadata: {f}")
 
     return processed, updated, skipped
 

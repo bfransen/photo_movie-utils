@@ -34,6 +34,8 @@ except ImportError:
     MUTAGEN_AVAILABLE = False
     print("Warning: mutagen not installed. Video metadata extraction will be unavailable.")
 
+from mp4_metadata import set_mp4_creation_time
+
 IMAGE_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
     '.heic', '.heif', '.raw', '.cr2', '.nef', '.orf', '.sr2'
@@ -299,11 +301,14 @@ def _set_creation_time_windows(file_path: Path, timestamp: datetime) -> None:
 
 
 def apply_timestamps(target_path: Path, timestamp: datetime) -> None:
-    """Apply the timestamp to the output file (mtime/atime, and creation time on Windows)."""
+    """Apply the timestamp to the output file (mtime/atime, creation time on Windows, and MP4 metadata)."""
     epoch = timestamp.timestamp()
     logging.info(f"Setting timestamps on {target_path.name}: {timestamp} (epoch {epoch})")
     os.utime(target_path, (epoch, epoch))
     _set_creation_time_windows(target_path, timestamp)
+    # Set creation_time in MP4 container metadata (requires ffmpeg)
+    if target_path.suffix.lower() in ('.mp4', '.m4v') and set_mp4_creation_time(target_path, timestamp):
+        logging.info(f"  -> Set MP4 creation_time metadata: {target_path.name}")
     # Log what the file has after (so we can confirm it took effect)
     try:
         st = target_path.stat()
